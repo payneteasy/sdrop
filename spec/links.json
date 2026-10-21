@@ -1,0 +1,57 @@
+{
+ "valid": [
+  {
+   "fragment": "Mm5Rp0yawLM3m6YPQqu9mJNe4LZhF22G9udSgF1DfC4",
+   "key_hex": "326e51a74c9ac0b3379ba60f42abbd98935ee0b661176d86f6e752805d437c2e",
+   "passphrase_hint": false
+  },
+  {
+   "fragment": "Mm5Rp0yawLM3m6YPQqu9mJNe4LZhF22G9udSgF1DfC4~p",
+   "key_hex": "326e51a74c9ac0b3379ba60f42abbd98935ee0b661176d86f6e752805d437c2e",
+   "passphrase_hint": true
+  },
+  {
+   "fragment": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+   "key_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+   "passphrase_hint": false
+  }
+ ],
+ "invalid": [
+  {
+   "name": "empty",
+   "fragment": ""
+  },
+  {
+   "name": "nonzero-trailing-bits",
+   "fragment": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB"
+  },
+  {
+   "name": "short",
+   "fragment": "Mm5Rp0yawLM3m6YPQqu9mJNe4LZhF22G9udSgF1DfC"
+  },
+  {
+   "name": "long",
+   "fragment": "Mm5Rp0yawLM3m6YPQqu9mJNe4LZhF22G9udSgF1DfC4A"
+  },
+  {
+   "name": "padding",
+   "fragment": "Mm5Rp0yawLM3m6YPQqu9mJNe4LZhF22G9udSgF1DfC4="
+  },
+  {
+   "name": "std-alphabet",
+   "fragment": "Mm5Rp0yawLM3m6YPQqu9mJNe4LZhF22G9udSgF1DfC+"
+  },
+  {
+   "name": "bad-suffix",
+   "fragment": "Mm5Rp0yawLM3m6YPQqu9mJNe4LZhF22G9udSgF1DfC4~x"
+  },
+  {
+   "name": "suffix-twice",
+   "fragment": "Mm5Rp0yawLM3m6YPQqu9mJNe4LZhF22G9udSgF1DfC4~p~p"
+  },
+  {
+   "name": "space",
+   "fragment": " m5Rp0yawLM3m6YPQqu9mJNe4LZhF22G9udSgF1DfC4"
+  }
+ ]
+}

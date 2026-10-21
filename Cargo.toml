@@ -1,0 +1,31 @@
+[package]
+name = "sdrop"
+version = "0.1.0"
+edition = "2024"
+description = "One-time secrets encrypted locally: the Payneteasy Secrets command line client"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/payneteasy/sdrop"
+readme = "README.md"
+publish = false
+
+[features]
+# Integration tests only: http://127.0.0.1, tokens only from SDROP_TEST_* (README, "Tests").
+test-loopback = []
+
+[dependencies]
+aes-gcm = { version = "0.11.1", features = ["zeroize"] }
+base64 = "0.23.1"
+clap = { version = "4.6.7", features = ["derive"] }
+getrandom = "0.4.3"
+hkdf = "0.13.0"
+pbkdf2 = "0.13.0"
+rpassword = "7.5.4"
+serde_json = "1.0.154"
+sha2 = { version = "0.11.1", features = ["zeroize"] }
+unicode-normalization = "0.1.26"
+ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
+zeroize = "1.9.1"
+
+# PBKDF2 with 600 000 iterations is too slow in a debug build without dependency optimization.
+[profile.dev.package."*"]
+opt-level = 3
