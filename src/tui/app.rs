@@ -597,10 +597,17 @@ fn render_input(f: &mut Frame, area: Rect, input: &Input, title: &str, focused: 
     );
     let dy = line.saturating_sub(h.saturating_sub(1));
     let dx = col.saturating_sub(w.saturating_sub(1));
+    // Only the visible window is handed to ratatui (slices of the text, no copies): offsets of any
+    // size work, unlike Paragraph::scroll with its u16 offsets.
+    let visible: Vec<Line> = input
+        .text()
+        .split('\n')
+        .skip(dy)
+        .take(h.max(1))
+        .map(|l| Line::raw(skip_cols(l, dx)))
+        .collect();
     f.render_widget(
-        Paragraph::new(input.text())
-            .scroll((dy as u16, dx as u16))
-            .block(focused_block(title, focused)),
+        Paragraph::new(visible).block(focused_block(title, focused)),
         area,
     );
     if focused && w > 0 && h > 0 {
@@ -609,6 +616,18 @@ fn render_input(f: &mut Frame, area: Rect, input: &Input, title: &str, focused: 
             y: area.y + 1 + (line - dy) as u16,
         });
     }
+}
+
+/// The part of a line after its first `cols` terminal cells.
+fn skip_cols(line: &str, cols: usize) -> &str {
+    let mut seen = 0;
+    for (i, c) in line.char_indices() {
+        if seen >= cols {
+            return &line[i..];
+        }
+        seen += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+    }
+    ""
 }
 
 fn render_new(f: &mut Frame, area: Rect, form: &NewForm) {
@@ -900,6 +919,13 @@ pub mod tests {
             screen_text(&app).contains("LAST-LINE"),
             "the last line is visible"
         );
+        // Beyond u16 offsets: a 70 KB single line still shows its end.
+        let Screen::New(f) = &mut app.screen else {
+            unreachable!()
+        };
+        f.text.clear();
+        app.paste(&format!("{}TAIL-OF-70K", "y".repeat(70_000)));
+        assert!(screen_text(&app).contains("TAIL-OF-70K"));
     }
 
     #[test]
