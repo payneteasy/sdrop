@@ -2,7 +2,10 @@
 //! for the session; on exit, error and panic the screen is cleared *before* leaving the alternate
 //! screen, so a shown secret does not stay in the terminal or its scrollback.
 
-use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::terminal::{
     Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
@@ -29,6 +32,8 @@ pub fn restore() {
         out,
         Clear(ClearType::All),
         cursor::MoveTo(0, 0),
+        PopKeyboardEnhancementFlags,
+        DisableMouseCapture,
         DisableBracketedPaste,
         LeaveAlternateScreen,
         cursor::Show
@@ -57,7 +62,15 @@ impl Guard {
         enable_raw_mode()?;
         ACTIVE.store(true, Ordering::SeqCst);
         let mut out = stdout();
-        if let Err(e) = execute!(out, EnterAlternateScreen, EnableBracketedPaste) {
+        // Mouse clicks and the wheel; Shift/Cmd+Enter where the terminal supports the keyboard
+        // protocol (others ignore the request).
+        if let Err(e) = execute!(
+            out,
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            EnableMouseCapture,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        ) {
             restore();
             return Err(e);
         }

@@ -40,6 +40,7 @@ pub fn run() -> Result<(), CliError> {
         }
         match event::read().map_err(io)? {
             Event::Key(k) if k.kind != KeyEventKind::Release => app.key(k),
+            Event::Mouse(m) => app.mouse(m),
             Event::Paste(s) => {
                 let s = Zeroizing::new(s);
                 app.paste(&s);

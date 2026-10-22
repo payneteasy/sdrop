@@ -27,32 +27,59 @@ pub trait Clip {
     fn schedule_clear(&mut self, _hash: [u8; 32], _delay: std::time::Duration) {}
 }
 
-/// Remove the copied text if the clipboard still holds it; retried while the clipboard is
-/// unavailable (bounded: about five minutes).
-fn clear_if_same(hash: [u8; 32]) {
+/// Outcome of one removal attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attempt {
+    /// Removed, or the clipboard holds something else now: nothing more to do.
+    Done,
+    /// The clipboard could not be used: try again later.
+    Retry,
+}
+
+/// One attempt with the system clipboard: remove the text with this SHA-256 if it is still there.
+fn attempt_clear(hash: [u8; 32]) -> Attempt {
     use sha2::{Digest, Sha256};
-    for _ in 0..60 {
-        if let Ok(mut b) = arboard::Clipboard::new() {
-            match b.get_text() {
-                Ok(t) => {
-                    let t = Zeroizing::new(t);
-                    if <[u8; 32]>::from(Sha256::digest(t.as_bytes())) != hash || b.clear().is_ok() {
-                        return;
-                    }
-                }
-                Err(arboard::Error::ContentNotAvailable) => return,
-                Err(_) => {}
+    let Ok(mut b) = arboard::Clipboard::new() else {
+        return Attempt::Retry;
+    };
+    match b.get_text() {
+        Ok(t) => {
+            let t = Zeroizing::new(t);
+            if <[u8; 32]>::from(Sha256::digest(t.as_bytes())) != hash || b.clear().is_ok() {
+                Attempt::Done
+            } else {
+                Attempt::Retry
             }
         }
-        std::thread::sleep(std::time::Duration::from_secs(5));
+        Err(arboard::Error::ContentNotAvailable) => Attempt::Done,
+        Err(_) => Attempt::Retry,
+    }
+}
+
+/// The removal timer of generation `mine`: each attempt runs under the lock that `copy` takes, and
+/// only while no newer copy happened, so a retry of an old timer never removes a newer copy.
+pub fn run_clear(
+    generation: &std::sync::Mutex<u64>,
+    mine: u64,
+    mut attempt: impl FnMut() -> Attempt,
+    mut wait: impl FnMut(),
+) {
+    for _ in 0..60 {
+        {
+            let current = generation.lock().unwrap_or_else(|e| e.into_inner());
+            if *current != mine || attempt() == Attempt::Done {
+                return;
+            }
+        }
+        wait();
     }
 }
 
 pub struct SystemClip {
     board: Option<arboard::Clipboard>,
     ssh: bool,
-    /// Generation of the latest scheduled removal: an older timer leaves a newer copy alone.
-    generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Generation of the latest copy; taken by `copy` and by every removal attempt.
+    generation: std::sync::Arc<std::sync::Mutex<u64>>,
 }
 
 impl SystemClip {
@@ -85,6 +112,8 @@ pub fn osc52(text: &str) -> Zeroizing<String> {
 
 impl Clip for SystemClip {
     fn copy(&mut self, text: &str) -> Result<Via, String> {
+        let mut generation = self.generation.lock().unwrap_or_else(|e| e.into_inner());
+        *generation += 1;
         if !self.ssh
             && let Some(b) = self.board.as_mut()
             && b.set_text(text).is_ok()
@@ -119,20 +148,18 @@ impl Clip for SystemClip {
     fn schedule_clear(&mut self, hash: [u8; 32], delay: std::time::Duration) {
         if self.board.is_some() {
             let generation = self.generation.clone();
-            let mine = generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            let mine = *generation.lock().unwrap_or_else(|e| e.into_inner());
             std::thread::spawn(move || {
                 std::thread::sleep(delay);
-                if is_current(&generation, mine) {
-                    clear_if_same(hash);
-                }
+                run_clear(
+                    &generation,
+                    mine,
+                    || attempt_clear(hash),
+                    || std::thread::sleep(std::time::Duration::from_secs(5)),
+                );
             });
         }
     }
-}
-
-/// The timer of generation `mine` is still the latest one.
-fn is_current(generation: &std::sync::atomic::AtomicU64, mine: u64) -> bool {
-    generation.load(std::sync::atomic::Ordering::SeqCst) == mine
 }
 
 #[cfg(test)]
@@ -140,16 +167,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_older_timer_is_not_current() {
-        let g = std::sync::atomic::AtomicU64::new(0);
-        let first = g.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-        assert!(is_current(&g, first));
-        let second = g.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-        assert!(
-            !is_current(&g, first),
-            "copied again: the first timer leaves it alone"
+    fn an_old_timer_retry_never_removes_a_newer_copy() {
+        use std::sync::Mutex;
+        // The clipboard is unavailable at the first attempt; meanwhile the secret is copied again.
+        let generation = Mutex::new(1);
+        let mut attempts = 0;
+        run_clear(
+            &generation,
+            1,
+            || {
+                attempts += 1;
+                Attempt::Retry
+            },
+            || *generation.lock().unwrap() += 1,
         );
-        assert!(is_current(&g, second));
+        assert_eq!(attempts, 1, "the retry saw the newer copy and stopped");
+        // Still the latest copy: attempts go on until done.
+        let generation = Mutex::new(5);
+        let mut n = 0;
+        run_clear(
+            &generation,
+            5,
+            || {
+                n += 1;
+                if n < 3 { Attempt::Retry } else { Attempt::Done }
+            },
+            || {},
+        );
+        assert_eq!(n, 3);
     }
 
     #[test]
