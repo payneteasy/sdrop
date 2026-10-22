@@ -48,24 +48,27 @@ impl Input {
     }
 
     /// Insert text at the cursor; in a single-line field line breaks become spaces (a pasted link
-    /// with a trailing newline stays one line).
+    /// with a trailing newline stays one line). Built directly in a wiped buffer of the final
+    /// size: no intermediate copy and no reallocation leaves the secret behind.
     pub fn insert(&mut self, s: &str) {
-        let s: String = if self.multiline {
-            s.replace("\r\n", "\n").replace('\r', "\n")
-        } else {
-            s.chars()
-                .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
-                .collect()
-        };
-        let s = Zeroizing::new(s);
-        // Grow into a fresh wiped buffer: a reallocation would leave an unwiped copy behind.
         let at = self.byte_at(self.cursor);
         let mut t = Zeroizing::new(String::with_capacity(self.text.len() + s.len()));
         t.push_str(&self.text[..at]);
-        t.push_str(&s);
+        let mut added = 0;
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            let c = match c {
+                '\r' if chars.peek() == Some(&'\n') => continue,
+                '\r' | '\n' if self.multiline => '\n',
+                '\r' | '\n' => ' ',
+                c => c,
+            };
+            t.push(c);
+            added += 1;
+        }
         t.push_str(&self.text[at..]);
         self.text = t;
-        self.cursor += s.chars().count();
+        self.cursor += added;
     }
 
     pub fn backspace(&mut self) {
@@ -99,18 +102,21 @@ impl Input {
         self.cursor = (self.cursor + 1).min(self.text.chars().count());
     }
 
-    /// Start and end (char indices) of the line with the cursor.
+    /// Start and end (char indices) of the line with the cursor, scanning the text in place.
     fn line_bounds(&self) -> (usize, usize) {
-        let chars: Vec<char> = self.text.chars().collect();
-        let mut start = self.cursor;
-        while start > 0 && chars[start - 1] != '\n' {
-            start -= 1;
+        let (mut start, mut end) = (0, None);
+        for (i, c) in self.text.chars().enumerate() {
+            if c != '\n' {
+                continue;
+            }
+            if i < self.cursor {
+                start = i + 1;
+            } else {
+                end = Some(i);
+                break;
+            }
         }
-        let mut end = self.cursor;
-        while end < chars.len() && chars[end] != '\n' {
-            end += 1;
-        }
-        (start, end)
+        (start, end.unwrap_or_else(|| self.text.chars().count()))
     }
 
     pub fn home(&mut self) {
@@ -145,11 +151,18 @@ impl Input {
         self.cursor = (nstart + col).min(nend);
     }
 
-    /// Line and column of the cursor, for placing the terminal cursor.
+    /// Line and display column of the cursor (terminal cells: wide characters take two, combining
+    /// marks none), for placing the terminal cursor. Computed in place, without copies.
     pub fn line_col(&self) -> (usize, usize) {
-        let before: String = self.text.chars().take(self.cursor).collect();
-        let line = before.matches('\n').count();
-        let col = before.rsplit('\n').next().map_or(0, |l| l.chars().count());
+        let (mut line, mut col) = (0, 0);
+        for c in self.text.chars().take(self.cursor) {
+            if c == '\n' {
+                line += 1;
+                col = 0;
+            } else {
+                col += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+            }
+        }
         (line, col)
     }
 }
@@ -180,7 +193,8 @@ mod tests {
         let mut i = Input::new(true);
         i.insert("ключ\r\nдва 🔐");
         assert_eq!(i.text(), "ключ\nдва 🔐");
-        assert_eq!(i.line_col(), (1, 5));
+        // "два 🔐": three letters, a space and a wide emoji = 6 cells.
+        assert_eq!(i.line_col(), (1, 6));
         i.up();
         assert_eq!(i.line_col(), (0, 4));
         i.home();
@@ -192,5 +206,18 @@ mod tests {
         assert_eq!((i.text(), i.cursor()), ("abc", 3));
         i.clear();
         assert_eq!(i.text(), "");
+    }
+
+    #[test]
+    fn display_width_of_wide_and_combining() {
+        let mut i = Input::new(false);
+        i.insert("界a");
+        assert_eq!(i.line_col(), (0, 3));
+        i.set("e\u{301}x");
+        assert_eq!(i.line_col(), (0, 2));
+        let mut m = Input::new(true);
+        m.insert("a\r\nb\rc\n");
+        assert_eq!(m.text(), "a\nb\nc\n");
+        assert_eq!(m.line_col(), (3, 0));
     }
 }

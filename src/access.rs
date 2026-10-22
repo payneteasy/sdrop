@@ -51,10 +51,12 @@ pub fn user_preset() -> Result<Option<Credentials>, CliError> {
 }
 
 /// Token after an Access redirect: from cloudflared (in the test build cloudflared is not invoked;
-/// SDROP_TEST_CLOUDFLARED_TOKEN emulates its answer).
-pub fn user_login(origin: &Origin) -> Result<Credentials, CliError> {
+/// SDROP_TEST_CLOUDFLARED_TOKEN emulates its answer). `interactive`: may run `cloudflared access
+/// login`, which prints and reads the terminal (CLI); otherwise only an existing cloudflared
+/// session is used, silently (TUI, which owns the terminal).
+pub fn user_login(origin: &Origin, interactive: bool) -> Result<Credentials, CliError> {
     if cfg!(feature = "test-loopback") {
-        let _ = origin;
+        let _ = (origin, interactive);
         return match env_secret("SDROP_TEST_CLOUDFLARED_TOKEN") {
             Some(t) => checked(Credentials::User(t)),
             None => err(
@@ -62,11 +64,11 @@ pub fn user_login(origin: &Origin) -> Result<Credentials, CliError> {
             ),
         };
     }
-    checked(Credentials::User(cloudflared_token(origin)?))
+    checked(Credentials::User(cloudflared_token(origin, interactive)?))
 }
 
 #[cfg(not(feature = "test-loopback"))]
-fn cloudflared_token(origin: &Origin) -> Result<Zeroizing<String>, CliError> {
+fn cloudflared_token(origin: &Origin, interactive: bool) -> Result<Zeroizing<String>, CliError> {
     use std::process::{Command, Stdio};
     let token = || -> Option<Zeroizing<String>> {
         let out = Command::new("cloudflared")
@@ -80,6 +82,12 @@ fn cloudflared_token(origin: &Origin) -> Result<Zeroizing<String>, CliError> {
     };
     if let Some(t) = token() {
         return Ok(t);
+    }
+    if !interactive {
+        return err(format!(
+            "Cloudflare Access login is required: run `cloudflared access login {}` or set SDROP_ACCESS_TOKEN, then try again",
+            origin.as_str()
+        ));
     }
     eprintln!("Signing in to Cloudflare Access with cloudflared...");
     let login = Command::new("cloudflared")
@@ -96,6 +104,6 @@ fn cloudflared_token(origin: &Origin) -> Result<Zeroizing<String>, CliError> {
 }
 
 #[cfg(feature = "test-loopback")]
-fn cloudflared_token(_origin: &Origin) -> Result<Zeroizing<String>, CliError> {
+fn cloudflared_token(_origin: &Origin, _interactive: bool) -> Result<Zeroizing<String>, CliError> {
     err("test build never calls cloudflared")
 }

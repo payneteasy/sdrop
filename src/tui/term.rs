@@ -43,10 +43,15 @@ pub struct Guard {
 impl Guard {
     pub fn enter() -> std::io::Result<Guard> {
         HOOK.call_once(|| {
-            let previous = std::panic::take_hook();
-            std::panic::set_hook(Box::new(move |info| {
+            // The default hook would print the panic message, which might carry text from the
+            // screen; only the location is printed, after the terminal is restored.
+            std::panic::set_hook(Box::new(|info| {
                 restore();
-                previous(info);
+                let place = info
+                    .location()
+                    .map(|l| format!(" at {}:{}", l.file(), l.line()))
+                    .unwrap_or_default();
+                eprintln!("sdrop: internal error{place}");
             }));
         });
         enable_raw_mode()?;
@@ -66,18 +71,28 @@ impl Guard {
     }
 }
 
+impl Guard {
+    /// Overwrite both frame buffers in memory (the last frames may show the secret). Cells hold
+    /// short symbols inline, so resetting a cell overwrites its bytes in place.
+    fn wipe_buffers(&mut self) {
+        self.terminal.current_buffer_mut().reset();
+        self.terminal.swap_buffers();
+        self.terminal.current_buffer_mut().reset();
+    }
+}
+
 impl Drop for Guard {
     fn drop(&mut self) {
-        // After a panic the hook has already restored the terminal: drawing now would clear the
-        // user's normal screen instead of the alternate one.
-        if !ACTIVE.load(Ordering::SeqCst) {
-            return;
+        // After a panic the hook has already restored the terminal: nothing is drawn then (it would
+        // clear the user's normal screen), only the memory is wiped.
+        if ACTIVE.load(Ordering::SeqCst) {
+            // A blank frame clears the alternate screen before it is left.
+            let _ = self.terminal.draw(|f| {
+                let area = f.area();
+                f.render_widget(ratatui::widgets::Clear, area);
+            });
+            restore();
         }
-        // A blank frame overwrites the rendered cells (the secret) in ratatui's buffers too.
-        let _ = self.terminal.draw(|f| {
-            let area = f.area();
-            f.render_widget(ratatui::widgets::Clear, area);
-        });
-        restore();
+        self.wipe_buffers();
     }
 }

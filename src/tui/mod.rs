@@ -49,7 +49,11 @@ fn test_exit(app: &App) -> Result<(), CliError> {
     let _ = app;
     match std::env::var("SDROP_TEST_TUI_EXIT").as_deref() {
         Ok("error") => Err(CliError::Msg("test error".into())),
-        Ok("panic") => panic!("test panic"),
+        // The panic message carries the marker: it must not be printed after the terminal is restored.
+        Ok("panic") => panic!(
+            "test panic {}",
+            std::env::var("SDROP_TEST_TUI_MARKER").unwrap_or_default()
+        ),
         _ => Ok(()),
     }
 }

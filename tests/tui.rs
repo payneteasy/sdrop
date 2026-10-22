@@ -17,8 +17,10 @@ fn in_pty(exit: &str) -> String {
             .args(["-q", "/dev/null", "sh", "-c", &inner])
             .output()
     } else {
+        // script -c runs the command with the shell itself: no extra quoting layer, so `$?` is
+        // expanded after sdrop exits.
         Command::new("script")
-            .args(["-qec", &format!("sh -c \"{inner}\""), "/dev/null"])
+            .args(["-qec", &inner, "/dev/null"])
             .output()
     }
     .expect("script(1) is needed for this test");
@@ -46,6 +48,12 @@ fn check(exit: &str) {
         "raw mode not restored: {stty:?}"
     );
     assert!(out.contains("EXIT=") && !out.contains("EXIT=0"), "{out:?}");
+    if exit == "panic" {
+        assert!(
+            out[leave..].contains("sdrop: internal error at "),
+            "{out:?}"
+        );
+    }
 }
 
 #[test]

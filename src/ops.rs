@@ -7,11 +7,16 @@ use crate::format::{self, Content, FormatError};
 use serde_json::Value;
 use zeroize::Zeroizing;
 
-/// The trusted service with the user's Access credentials (obtained lazily on a redirect).
+/// The trusted service with the user's Access credentials. The explicit token is read right before
+/// the first request (after all local checks, as the CLI always did); on an Access redirect without
+/// a token one is obtained and the request is retried once.
 pub struct Client {
     pub origin: Origin,
     agent: ureq::Agent,
     creds: Option<Credentials>,
+    creds_read: bool,
+    /// May run the interactive `cloudflared access login` (CLI); the TUI must not.
+    interactive_login: bool,
 }
 
 /// Links of a created secret.
@@ -75,12 +80,14 @@ pub fn human_size(n: usize) -> String {
 }
 
 impl Client {
-    /// The configured origin (SDROP_ORIGIN or the built-in one) and an explicit token, if any.
-    pub fn new() -> Result<Client, CliError> {
+    /// The configured origin (SDROP_ORIGIN or the built-in one). No credentials are read yet.
+    pub fn new(interactive_login: bool) -> Result<Client, CliError> {
         Ok(Client {
             origin: Origin::configured()?,
             agent: api::agent(),
-            creds: access::user_preset()?,
+            creds: None,
+            creds_read: false,
+            interactive_login,
         })
     }
 
@@ -101,15 +108,29 @@ impl Client {
         extra: &[(&str, &str)],
         body: Option<&[u8]>,
     ) -> Result<api::Reply, CliError> {
-        api::call_user(
-            &self.agent,
-            &self.origin,
-            method,
-            path,
-            &mut self.creds,
-            extra,
-            body,
-        )
+        if !self.creds_read {
+            self.creds = access::user_preset()?;
+            self.creds_read = true;
+        }
+        let send = |c: &Client| {
+            api::call(
+                &c.agent,
+                &c.origin,
+                method,
+                path,
+                c.creds.as_ref(),
+                extra,
+                body,
+            )
+        };
+        match send(self) {
+            // The redirect is Access asking for login: the request never reached the service.
+            Err(CliError::Redirect(_)) if self.creds.is_none() => {
+                self.creds = Some(access::user_login(&self.origin, self.interactive_login)?);
+                send(self)
+            }
+            r => r,
+        }
     }
 
     /// Service limit (`GET /api/limits`): one of the format buckets.

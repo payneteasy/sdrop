@@ -1584,3 +1584,38 @@ fn get_bundle_partial_write_leaves_nothing_behind() {
     assert_eq!(std::fs::read_dir(&cwd).unwrap().count(), 0);
     assert_eq!(f.requests().len(), 1);
 }
+
+#[test]
+fn local_checks_come_before_reading_the_access_token() {
+    // An unusable Access token is reported only when a request is about to be sent: a broken link
+    // or a bad -o path is reported first, as the CLI always did.
+    let f = never_called();
+    let existing = temp_file(b"keep");
+    let cases: [(&[&str], &str); 4] = [
+        (&["get", "http://127.0.0.1:1/s/zz#k"], "the link is not for"),
+        (&["status", "x"], ""),
+        (&["revoke", "x"], ""),
+        (&["get", "-o", &existing, "PLACEHOLDER"], "already exists"),
+    ];
+    for (args, want) in cases {
+        let url = format!("{}/s/{ID}#{}", f.origin, "A".repeat(43));
+        let args: Vec<&str> = args
+            .iter()
+            .map(|a| if *a == "PLACEHOLDER" { url.as_str() } else { a })
+            .collect();
+        let out = Command::new(env!("CARGO_BIN_EXE_sdrop"))
+            .args(&args)
+            .env_clear()
+            .envs(platform_env())
+            .env("SDROP_ORIGIN", &f.origin)
+            .env("SDROP_TEST_ACCESS_TOKEN", "bad token with spaces")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_ne!(out.status.code(), Some(0), "{args:?}");
+        assert!(!stderr.contains("invalid characters"), "{args:?}: {stderr}");
+        assert!(stderr.contains(want), "{args:?}: {stderr}");
+    }
+    assert_eq!(f.requests().len(), 0);
+}

@@ -262,27 +262,6 @@ pub fn call(
     })
 }
 
-/// User request: first with the explicit token or without one; on an Access redirect without a
-/// token, obtain a token and retry once (the request never reached the service, nothing burned).
-#[allow(clippy::too_many_arguments)]
-pub fn call_user(
-    agent: &ureq::Agent,
-    origin: &Origin,
-    method: &str,
-    path: &str,
-    creds: &mut Option<Credentials>,
-    extra: &[(&str, &str)],
-    body: Option<&[u8]>,
-) -> Result<Reply, CliError> {
-    match call(agent, origin, method, path, creds.as_ref(), extra, body) {
-        Err(CliError::Redirect(_)) if creds.is_none() => {
-            *creds = Some(crate::access::user_login(origin)?);
-            call(agent, origin, method, path, creds.as_ref(), extra, body)
-        }
-        r => r,
-    }
-}
-
 /// ureq error class without details (they may contain the URL).
 fn error_kind(e: &ureq::Error) -> &'static str {
     match e {

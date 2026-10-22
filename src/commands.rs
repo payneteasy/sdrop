@@ -203,7 +203,7 @@ pub fn put(a: PutArgs) -> Result<(String, String, String), CliError> {
         }
         (None, false) => None,
     };
-    let mut client = Client::new()?;
+    let mut client = Client::new(true)?;
     let created = client.create(&content, passphrase.as_deref().map(String::as_str), ttl)?;
     Ok((
         created.recipient.to_string(),
@@ -224,7 +224,7 @@ pub fn link_arg(url: &str) -> Result<Zeroizing<String>, CliError> {
 /// Secret text. Passphrase: from a file, always before the request; from the terminal, before the
 /// request on `~p`, after it on the envelope flag. Wrong passphrase retry: terminal only (up to 3).
 pub fn get(url: &str, passphrase_file: Option<&Path>, out: Option<&Path>) -> Result<(), CliError> {
-    let mut client = Client::new()?;
+    let mut client = Client::new(true)?;
     let link = client.recipient_link(url)?;
     if let Some(p) = out.filter(|p| *p != Path::new("-")) {
         save::check_target(p)?;
@@ -454,13 +454,13 @@ fn status_text(s: &Status) -> String {
 }
 
 pub fn status(url: &str) -> Result<String, CliError> {
-    let mut client = Client::new()?;
+    let mut client = Client::new(true)?;
     let link = client.owner_link(url)?;
     Ok(status_text(&client.status(&link)?))
 }
 
 pub fn revoke(url: &str) -> Result<String, CliError> {
-    let mut client = Client::new()?;
+    let mut client = Client::new(true)?;
     let link = client.owner_link(url)?;
     match client.revoke(&link)? {
         Revoked::Done => Ok("revoked\n".into()),
