@@ -236,20 +236,24 @@ fn ctrl(c: char) -> KeyEvent {
     KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
 }
 
-/// A row of buttons; the first may be primary (filled). Each records its click area.
+/// Buttons in rows: a button that does not fit moves to the next row (never cut). The first may
+/// be primary (filled). Each records its click area.
 fn render_buttons(f: &mut Frame, area: Rect, buttons: &[(String, Hit, bool)], hits: &mut Hits) {
-    let mut x = area.x;
+    let (mut x, mut y) = (area.x, area.y);
     for (label, hit, primary) in buttons {
         let text = format!(" {label} ");
-        let w = (unicode_width::UnicodeWidthStr::width(text.as_str()) as u16)
-            .min(area.right().saturating_sub(x));
-        if w == 0 {
+        let w = unicode_width::UnicodeWidthStr::width(text.as_str()) as u16;
+        if x > area.x && x + w > area.right() {
+            x = area.x;
+            y += 1;
+        }
+        if y >= area.bottom() {
             break;
         }
         let r = Rect {
             x,
-            y: area.y,
-            width: w,
+            y,
+            width: w.min(area.right().saturating_sub(x)),
             height: 1,
         };
         let style = if *primary {
@@ -573,6 +577,7 @@ impl App {
                     KeyModifiers::SHIFT
                         | KeyModifiers::SUPER
                         | KeyModifiers::CONTROL
+                        | KeyModifiers::ALT
                         | KeyModifiers::META,
                 ) =>
             {
@@ -957,9 +962,22 @@ impl App {
             Screen::Status(_) => "r check status · x revoke · Esc home",
         };
         let buttons = self.buttons();
+        // Rows the buttons need at this width (they wrap rather than get cut).
+        let rows = {
+            let (mut rows, mut x) = (1u16, 0u16);
+            for (label, _, _) in &buttons {
+                let w = unicode_width::UnicodeWidthStr::width(label.as_str()) as u16 + 2;
+                if x > 0 && x + w > body.width {
+                    rows += 1;
+                    x = 0;
+                }
+                x += w + 2;
+            }
+            rows
+        };
         let [body, bar] = Layout::vertical([
             Constraint::Min(1),
-            Constraint::Length(if buttons.is_empty() { 0 } else { 2 }),
+            Constraint::Length(if buttons.is_empty() { 0 } else { rows + 1 }),
         ])
         .areas(body);
         match &self.screen {
@@ -976,7 +994,7 @@ impl App {
         // A blank line, then the buttons.
         let bar = Rect {
             y: bar.y + 1,
-            height: 1,
+            height: bar.height.saturating_sub(1),
             ..bar
         };
         render_buttons(f, bar, &buttons, &mut hits);
@@ -1315,18 +1333,6 @@ fn render_new(f: &mut Frame, area: Rect, form: &NewForm, hits: &mut Hits) {
     .areas(area);
     hits.push((text, Hit::Focus(NewFocus::Text)));
     hits.push((path, Hit::Focus(NewFocus::Path)));
-    for i in 0..form.files.len().min(6) {
-        let y = files.y + 1 + i as u16;
-        hits.push((
-            Rect {
-                x: files.x + 1,
-                y,
-                width: files.width.saturating_sub(2),
-                height: 1,
-            },
-            Hit::File(i),
-        ));
-    }
     let title = if form.generated {
         " Secret (generated password) "
     } else {
@@ -1367,6 +1373,19 @@ fn render_new(f: &mut Frame, area: Rect, form: &NewForm, hits: &mut Hits) {
             .highlight_symbol("› ");
         let mut state = ListState::default().with_selected(Some(form.file_sel));
         f.render_stateful_widget(list, files, &mut state);
+        // Rows as drawn: the list may be scrolled to keep the selected file visible.
+        let rows = files.height.saturating_sub(2) as usize;
+        for row in 0..rows.min(form.files.len().saturating_sub(state.offset())) {
+            hits.push((
+                Rect {
+                    x: files.x + 1,
+                    y: files.y + 1 + row as u16,
+                    width: files.width.saturating_sub(2),
+                    height: 1,
+                },
+                Hit::File(state.offset() + row),
+            ));
+        }
     }
     let prefix = " If nobody opens it, delete after: ";
     let mut spans = vec![Span::raw(prefix)];
@@ -1857,6 +1876,7 @@ pub mod tests {
             ctrl('s'),
             KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
             KeyEvent::new(KeyCode::Enter, KeyModifiers::SUPER),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT),
         ] {
             app.pending = None;
             app.key(k);
@@ -1869,6 +1889,67 @@ pub mod tests {
             unreachable!()
         };
         assert_eq!(f.text.text(), "by mouse\n");
+    }
+
+    #[test]
+    fn clicks_on_a_scrolled_file_list_pick_the_drawn_file() {
+        let mut app = App::new(Box::new(MemClip::default()));
+        app.key(press(KeyCode::Enter));
+        let Screen::New(f) = &mut app.screen else {
+            unreachable!()
+        };
+        for i in 0..7 {
+            f.files.push(PickedFile {
+                path: format!("/x/f{i}").into(),
+                name: format!("f{i}"),
+                size: 1,
+            });
+        }
+        f.file_sel = 6;
+        f.focus = NewFocus::Files;
+        // Six rows are drawn with the last file selected: the list starts at f1.
+        let s = screen_text(&app);
+        assert!(!s.contains("f0  ") && s.contains("f6  "));
+        let first = app.hits.borrow().iter().find_map(|(_, h)| match h {
+            Hit::File(i) => Some(*i),
+            _ => None,
+        });
+        assert_eq!(first, Some(1), "the top drawn row is f1");
+        click(&mut app, Hit::File(1));
+        let Screen::New(f) = &app.screen else {
+            unreachable!()
+        };
+        assert_eq!(f.file_sel, 1);
+    }
+
+    #[test]
+    fn buttons_wrap_instead_of_being_cut_at_80_columns() {
+        let mut app = App::new(Box::new(MemClip::default()));
+        app.screen = Screen::Created(CreatedView {
+            recipient: Zeroizing::new("https://x/s/1#k".into()),
+            owner: Zeroizing::new("https://x/o/1#t".into()),
+            expires: "e".into(),
+            passphrase: false,
+            show_owner: true,
+        });
+        let mut t = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        t.draw(|f| app.render(f)).unwrap();
+        let text: String = t
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        for label in [
+            "Copy link  c",
+            "Hide status link  o",
+            "Copy status link  y",
+            "New secret  n",
+            "Home  Esc",
+        ] {
+            assert!(text.contains(label), "{label} is drawn whole");
+        }
     }
 
     #[test]

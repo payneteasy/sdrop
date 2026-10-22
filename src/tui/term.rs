@@ -4,6 +4,9 @@
 
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
+#[cfg(not(windows))]
+use crossterm::event::{
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{
@@ -27,17 +30,14 @@ pub fn restore() {
     if !ACTIVE.swap(false, Ordering::SeqCst) {
         return;
     }
+    // Step by step: a step that fails (an unsupported one) does not skip the rest.
     let mut out = stdout();
-    let _ = execute!(
-        out,
-        Clear(ClearType::All),
-        cursor::MoveTo(0, 0),
-        PopKeyboardEnhancementFlags,
-        DisableMouseCapture,
-        DisableBracketedPaste,
-        LeaveAlternateScreen,
-        cursor::Show
-    );
+    let _ = execute!(out, Clear(ClearType::All), cursor::MoveTo(0, 0));
+    #[cfg(not(windows))]
+    let _ = execute!(out, PopKeyboardEnhancementFlags);
+    let _ = execute!(out, DisableMouseCapture);
+    let _ = execute!(out, DisableBracketedPaste);
+    let _ = execute!(out, LeaveAlternateScreen, cursor::Show);
     let _ = disable_raw_mode();
 }
 
@@ -68,12 +68,17 @@ impl Guard {
             out,
             EnterAlternateScreen,
             EnableBracketedPaste,
-            EnableMouseCapture,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            EnableMouseCapture
         ) {
             restore();
             return Err(e);
         }
+        // Not on Windows: crossterm uses the console API there, which has no such protocol.
+        #[cfg(not(windows))]
+        let _ = execute!(
+            out,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
         match Terminal::new(CrosstermBackend::new(stdout())) {
             Ok(terminal) => Ok(Guard { terminal }),
             Err(e) => {
