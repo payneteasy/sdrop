@@ -20,6 +20,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
+use zeroize::Zeroizing;
 
 /// Smaller than this, only "enlarge the window" is shown; the state is kept.
 pub const MIN_W: u16 = 80;
@@ -395,17 +396,16 @@ fn render_new(f: &mut Frame, area: Rect, form: &NewForm, limit: Option<usize>, h
             let size = human_size(file.size as usize);
             // "> name  size [ Remove ]": the mark, the name, two spaces, the size in 8 cells.
             let name_w = (r.width as usize).saturating_sub(remove.width() as usize + 13);
-            let name: String = wrapped(&file.name, name_w.max(1))
-                .next()
-                .unwrap_or("")
-                .into();
+            let name = wrapped(&file.name, name_w.max(1)).next().unwrap_or("");
             let (mark, style) = if sel {
                 ("> ", theme::bold())
             } else {
                 ("  ", theme::text())
             };
             let line = Line::from(vec![
-                Span::styled(format!("{mark}{name:<name_w$}"), style),
+                Span::styled(mark, style),
+                Span::styled(name, style),
+                Span::raw(" ".repeat(name_w.saturating_sub(name.width()))),
                 Span::styled(format!("  {size:>8}"), theme::secondary()),
             ]);
             f.render_widget(Paragraph::new(line), r);
@@ -603,7 +603,8 @@ fn render_new(f: &mut Frame, area: Rect, form: &NewForm, limit: Option<usize>, h
 fn link_box(f: &mut Frame, col: &mut Col, title: &str, link: &str, style: Style) {
     let inner_w = col.area.width.saturating_sub(4).max(1) as usize;
     let rows: Vec<Line> = wrapped(link, inner_w)
-        .map(|l| Line::styled(format!(" {l}"), style))
+        // Spans borrow the link: no unwiped copies of the key or the token.
+        .map(|l| Line::from(vec![Span::raw(" "), Span::styled(l, style)]))
         .collect();
     let r = col.take(rows.len() as u16 + 2);
     f.render_widget(Paragraph::new(rows).block(boxed(title, false)), r);
@@ -835,7 +836,8 @@ fn render_revealed(f: &mut Frame, area: Rect, v: &RevealedView, hits: &mut Hits)
         let lines: Vec<Line> = wrapped(v.text(), w)
             .skip(top)
             .take(h)
-            .map(|l| Line::raw(format!(" {l}")))
+            // Borrowed from the secret: no unwiped copies.
+            .map(|l| Line::from(vec![Span::raw(" "), Span::raw(l)]))
             .collect();
         f.render_widget(
             Paragraph::new(lines).block(boxed(&title, v.focus == RevealedFocus::Text)),
@@ -864,17 +866,21 @@ fn render_revealed(f: &mut Frame, area: Rect, v: &RevealedView, hits: &mut Hits)
             title.push_str(&format!(" · {}–{}", top + 1, (top + h).min(files.len())));
         }
         let name_w = r.width.saturating_sub(16) as usize;
-        let lines: Vec<Line> = files
+        // File names are part of the secret: the printable copies are wiped, the spans borrow them.
+        let shown: Vec<(Zeroizing<String>, usize)> = files
             .iter()
             .skip(top)
             .take(h)
+            .map(|(n, s)| (Zeroizing::new(crate::api::printable(n)), *s))
+            .collect();
+        let lines: Vec<Line> = shown
+            .iter()
             .map(|(n, s)| {
-                let name: String = wrapped(&crate::api::printable(n), name_w.max(1))
-                    .next()
-                    .unwrap_or("")
-                    .into();
+                let name = wrapped(n, name_w.max(1)).next().unwrap_or("");
                 Line::from(vec![
-                    Span::raw(format!(" {name:<name_w$}")),
+                    Span::raw(" "),
+                    Span::raw(name),
+                    Span::raw(" ".repeat(name_w.saturating_sub(name.width()))),
                     Span::styled(format!(" {:>10}", human_size(*s)), theme::secondary()),
                 ])
             })

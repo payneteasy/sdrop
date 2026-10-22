@@ -779,7 +779,10 @@ impl App {
                     // Enter in the field: the screen's main action.
                     buttons[0].action
                 } else {
-                    buttons[focus - usize::from(has_field)].action
+                    match buttons.get(focus - usize::from(has_field)) {
+                        Some(b) if b.enabled => b.action,
+                        _ => return,
+                    }
                 };
                 return self.act(action);
             }
@@ -1006,7 +1009,17 @@ impl App {
                     let link = v.recipient.clone();
                     self.copy(&link, "Recipient link", false);
                 }
-                Action::ToggleOwner => v.show_owner = !v.show_owner,
+                // The buttons change: the focus stays on the same action, else on the toggle.
+                Action::ToggleOwner => {
+                    let before = created_buttons(v).get(v.focus).map(|b| b.action);
+                    v.show_owner = !v.show_owner;
+                    let after = created_buttons(v);
+                    let at = |a| after.iter().position(|b| b.action == a);
+                    v.focus = before
+                        .and_then(at)
+                        .or_else(|| at(Action::ToggleOwner))
+                        .unwrap_or(0);
+                }
                 Action::CopyOwner if v.show_owner => {
                     let link = v.owner.clone();
                     self.copy(&link, "Private sender link", false);

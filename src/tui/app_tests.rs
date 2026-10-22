@@ -391,6 +391,39 @@ fn created_keys_and_owner_link_toggle() {
         clip.value.lock().unwrap().as_deref(),
         Some("https://x/s/1#k")
     );
+    // Hiding the private link while Home (after Copy private sender link) is focused: the focus
+    // stays on Home, Enter goes home (no out-of-range button).
+    app.key(key(KeyCode::BackTab));
+    app.key(key(KeyCode::Char('o')));
+    let Screen::Created(v) = &app.screen else {
+        unreachable!()
+    };
+    assert_eq!(created_buttons(v)[v.focus].action, Action::Back);
+    // Focus on the hidden button itself: it moves to the toggle.
+    app.key(key(KeyCode::Char('o')));
+    if let Screen::Created(v) = &mut app.screen {
+        v.focus = 2;
+    }
+    app.key(key(KeyCode::Char('o')));
+    let Screen::Created(v) = &app.screen else {
+        unreachable!()
+    };
+    assert_eq!(created_buttons(v)[v.focus].action, Action::ToggleOwner);
+    // The sequence from the review: show, focus Home, hide, Enter.
+    app.key(key(KeyCode::Char('o')));
+    app.key(key(KeyCode::BackTab));
+    app.key(key(KeyCode::BackTab));
+    app.key(key(KeyCode::Char('o')));
+    app.key(key(KeyCode::Enter));
+    assert!(matches!(app.screen, Screen::Home { .. }));
+    app.screen = Screen::Created(CreatedView {
+        recipient: Zeroizing::new("https://x/s/1#k".into()),
+        owner: Zeroizing::new("https://x/o/1#t".into()),
+        expires: "e".into(),
+        passphrase: false,
+        show_owner: false,
+        focus: 0,
+    });
     app.key(key(KeyCode::Char('n')));
     assert!(matches!(app.screen, Screen::New(_)));
 }
