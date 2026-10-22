@@ -59,6 +59,26 @@ sdrop revoke 'https://secrets.example.com/o/…#…'
   answer asks again; Ctrl+D on an empty line (also on Windows) stops asking and tries the default
   directory.
 
+### Interactive mode
+
+`sdrop` without arguments on a terminal (or `sdrop tui`) opens a full-screen interface:
+
+- **New secret**: text (Ctrl+G generates a 24-character password), files by path (up to 20),
+  lifetime, passphrase; **Ctrl+S** creates the link from any field (Shift/Cmd/Alt+Enter too, in
+  terminals that report the modifier: kitty, WezTerm, Ghostty, Alacritty, iTerm2 with CSI u).
+- **Open a link**: nothing is sent until you confirm; the text is shown, files are saved into a
+  new private directory; a passphrase can be retried without fetching again.
+- **Check status**: read or not, revoke (asks twice).
+- **Mouse**: click fields, options and buttons; the wheel scrolls. While the mouse is captured,
+  select text in the terminal with Option (macOS) or Shift (Linux, Windows) held.
+- **Clipboard**: the system clipboard on this machine; over SSH, the terminal's OSC 52 (the
+  clipboard of the machine you sit at). A copied secret text is removed from the clipboard after
+  60 seconds (and on exit) if it is still there; links are not. Clipboard managers may keep a
+  history: `sdrop` warns before the first copy.
+- The screen is cleared before `sdrop` leaves its own screen, also on errors, so a secret does not
+  stay in the terminal's scrollback. What was shown passes through the terminal's own memory,
+  which `sdrop` cannot wipe.
+
 ### Settings
 
 | Variable | Meaning |
