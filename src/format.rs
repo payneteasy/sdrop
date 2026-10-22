@@ -80,22 +80,33 @@ pub fn encode_base64url(bytes: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
+/// A key or token in base64url (43 characters), appended to `out`: the caller reserves the room,
+/// so nothing is reallocated and no copy stays behind.
+pub fn push_key(out: &mut String, key: &[u8; KEY_LEN]) {
+    URL_SAFE_NO_PAD.encode_string(key, out);
+}
+
 /// Strict decoding into exactly 32 bytes: base64url alphabet only, no padding,
 /// re-encoding matches the input.
 pub fn decode_key(s: &str) -> Result<Key, FormatError> {
     if s.len() != 43 {
         return Err(FormatError::BadLink);
     }
-    let bytes = Zeroizing::new(
-        URL_SAFE_NO_PAD
-            .decode(s)
-            .map_err(|_| FormatError::BadLink)?,
-    );
-    if bytes.len() != KEY_LEN || encode_base64url(&bytes) != s {
+    // Decoded and re-encoded in wiped fixed buffers: a link checked and dropped leaves no copy.
+    let mut bytes = Zeroizing::new([0u8; 48]);
+    let n = URL_SAFE_NO_PAD
+        .decode_slice(s, &mut bytes[..])
+        .map_err(|_| FormatError::BadLink)?;
+    if n != KEY_LEN {
         return Err(FormatError::BadLink);
     }
     let mut key = Zeroizing::new([0u8; KEY_LEN]);
-    key.copy_from_slice(&bytes);
+    key.copy_from_slice(&bytes[..KEY_LEN]);
+    let mut again = Zeroizing::new(String::with_capacity(44));
+    push_key(&mut again, &key);
+    if again.as_str() != s {
+        return Err(FormatError::BadLink);
+    }
     Ok(key)
 }
 
@@ -173,27 +184,26 @@ pub fn valid_file_name(name: &str) -> bool {
             .any(|c| c < '\u{20}' || c == '\u{7f}' || c == '/' || c == '\\')
 }
 
-/// Name to send: base name, control characters -> `_`, at most 255 bytes.
-pub fn sanitize_file_name(raw: &str) -> String {
+/// Name to send: base name, control characters -> `_`, at most 255 bytes. In a wiped buffer
+/// reserved up front (`_` is never longer than the character it replaces).
+pub fn sanitize_file_name(raw: &str) -> Zeroizing<String> {
     let base = raw.rsplit(['/', '\\']).next().unwrap_or("");
-    let mut name: String = base
-        .chars()
-        .map(|c| {
-            if c < '\u{20}' || c == '\u{7f}' {
-                '_'
-            } else {
-                c
-            }
-        })
-        .collect();
+    let mut name = Zeroizing::new(String::with_capacity(base.len().max(4)));
+    for c in base.chars() {
+        name.push(if c < '\u{20}' || c == '\u{7f}' {
+            '_'
+        } else {
+            c
+        });
+    }
     while name.len() > 255 {
         name.pop();
     }
-    if name.is_empty() || name == "." || name == ".." {
-        "file".into()
-    } else {
-        name
+    if name.is_empty() || name.as_str() == "." || name.as_str() == ".." {
+        name.clear();
+        name.push_str("file");
     }
+    name
 }
 
 fn bucket_for(need: usize, max_bucket: usize) -> Result<usize, FormatError> {
@@ -260,7 +270,12 @@ pub fn encode_plaintext(
                 }
             }
             let sizes: Vec<(&str, usize)> = files.iter().map(|(n, d)| (*n, d.len())).collect();
-            joined = Zeroizing::new(files.iter().flat_map(|(_, d)| d.iter().copied()).collect());
+            let total = files.iter().map(|(_, d)| d.len()).sum();
+            let mut all = Zeroizing::new(Vec::with_capacity(total));
+            for (_, d) in files {
+                all.extend_from_slice(d);
+            }
+            joined = all;
             (bundle_header(text, &sizes)?, &joined[..])
         }
     };
@@ -560,9 +575,10 @@ fn passphrase_bytes(passphrase: &str) -> Result<Zeroizing<Vec<u8>>, FormatError>
     if passphrase.is_empty() {
         return Err(FormatError::EmptyPassphrase);
     }
-    Ok(Zeroizing::new(
-        passphrase.nfc().collect::<String>().into_bytes(),
-    ))
+    // NFC grows a string at most threefold (UAX #15): reserved up front, never reallocated.
+    let mut nfc = Zeroizing::new(String::with_capacity(passphrase.len() * 3));
+    nfc.extend(passphrase.nfc());
+    Ok(Zeroizing::new(std::mem::take(&mut *nfc).into_bytes()))
 }
 
 /// K_enc per FORMAT.md 1.
@@ -571,7 +587,9 @@ pub fn derive_key(
     salt: &[u8],
     passphrase: Option<&str>,
 ) -> Result<Key, FormatError> {
-    let mut ikm = Zeroizing::new(k_url.to_vec());
+    // Room for K_url and the derived key: extending does not reallocate.
+    let mut ikm = Zeroizing::new(Vec::with_capacity(2 * KEY_LEN));
+    ikm.extend_from_slice(k_url);
     if let Some(p) = passphrase {
         let pw = passphrase_bytes(p)?;
         let mut derived = Zeroizing::new([0u8; KEY_LEN]);

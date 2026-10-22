@@ -30,7 +30,8 @@ pub fn ttl_seconds(ttl: &str) -> Result<u32, CliError> {
 
 /// Input: a file or stdin ("-" or nothing). UTF-8 only.
 pub fn read_input(file: Option<&Path>) -> Result<Zeroizing<String>, CliError> {
-    let mut buf = Zeroizing::new(Vec::new());
+    // Room for the whole limit: reading never reallocates, so no copy of the secret stays behind.
+    let mut buf = Zeroizing::new(Vec::with_capacity(MAX_INPUT as usize));
     let read = match file {
         Some(p) if p != Path::new("-") => std::fs::File::open(p)
             .map_err(|_| {
@@ -151,20 +152,30 @@ pub struct PutArgs<'a> {
 }
 
 /// File for `put --file` and the TUI: bytes and the sanitized name.
-pub fn read_file_secret(p: &Path) -> Result<(String, Zeroizing<Vec<u8>>), CliError> {
+pub fn read_file_secret(p: &Path) -> Result<(Zeroizing<String>, Zeroizing<Vec<u8>>), CliError> {
     let shown = api::printable(&p.display().to_string());
-    let mut buf = Zeroizing::new(Vec::new());
-    std::fs::File::open(p)
-        .and_then(|f| f.take(MAX_INPUT + 1).read_to_end(&mut buf))
-        .map_err(|_| CliError::Msg(format!("cannot read {shown}")))?;
+    let cannot = || CliError::Msg(format!("cannot read {shown}"));
+    let file = std::fs::File::open(p).map_err(|_| cannot())?;
+    // The buffer holds the file as its size says (at most the limit, plus one byte to see more):
+    // reading stops there, so it never reallocates and leaves no copies of the contents.
+    let room = file.metadata().map_err(|_| cannot())?.len().min(MAX_INPUT) + 1;
+    let mut buf = Zeroizing::new(Vec::with_capacity(room as usize));
+    file.take(room)
+        .read_to_end(&mut buf)
+        .map_err(|_| cannot())?;
     if buf.len() as u64 > MAX_INPUT {
         return Err(FormatError::TooLarge.into());
     }
-    let raw = p
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    Ok((format::sanitize_file_name(&raw), buf))
+    if buf.len() as u64 == room {
+        return err(format!("{shown} changed while it was read"));
+    }
+    let raw = p.file_name().map(|n| n.to_string_lossy());
+    let name = format::sanitize_file_name(raw.as_deref().unwrap_or(""));
+    // A name that is not UTF-8 was converted into a copy: wiped too.
+    if let Some(std::borrow::Cow::Owned(s)) = raw {
+        drop(Zeroizing::new(s));
+    }
+    Ok((name, buf))
 }
 
 /// Recipient and sender links (stdout and stderr are handled in main).

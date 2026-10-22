@@ -309,8 +309,8 @@ fn clicks_on_a_scrolled_file_list_pick_the_drawn_file() {
     let f = new_form(&mut app);
     for i in 0..9 {
         f.files.push(PickedFile {
-            path: format!("/x/f{i}").into(),
-            name: format!("file-{i}"),
+            path: Zeroizing::new(format!("/x/f{i}")),
+            name: Zeroizing::new(format!("file-{i}")),
             size: 1,
         });
     }
@@ -330,7 +330,11 @@ fn clicks_on_a_scrolled_file_list_pick_the_drawn_file() {
     click(&mut app, Hit::Act(Action::RemoveFile(first), None));
     let f = new_form(&mut app);
     assert_eq!(f.files.len(), 8);
-    assert!(f.files.iter().all(|p| p.name != format!("file-{first}")));
+    assert!(
+        f.files
+            .iter()
+            .all(|p| p.name.as_str() != format!("file-{first}"))
+    );
 }
 
 #[test]
@@ -598,7 +602,7 @@ fn new_form_generate_files_and_validation() {
     press_button(&mut app, Action::AddFile);
     let f = new_form(&mut app);
     assert_eq!(f.files.len(), 1);
-    assert_eq!(f.files[0].name, "key.pem");
+    assert_eq!(f.files[0].name.as_str(), "key.pem");
     // The size counts the record as it is encrypted; over the service limit it says so.
     app.limit = Some(1024);
     let s = screen_text(&app);
@@ -775,8 +779,8 @@ fn snapshots() {
     app.paste("DB_PASSWORD=Xk29!fPq\nAPI_TOKEN=sk_live_example");
     let f = new_form(&mut app);
     f.files.push(PickedFile {
-        path: "/x/prod.env".into(),
-        name: "prod.env".into(),
+        path: Zeroizing::new("/x/prod.env".into()),
+        name: Zeroizing::new("prod.env".into()),
         size: 2400,
     });
     f.use_pass = true;

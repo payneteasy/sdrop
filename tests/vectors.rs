@@ -341,10 +341,11 @@ fn creation_errors() {
 
 #[test]
 fn sanitize_file_name_like_js() {
-    assert_eq!(format::sanitize_file_name("C:\\dir\\a\u{7}.txt"), "a_.txt");
-    assert_eq!(format::sanitize_file_name("/etc/passwd"), "passwd");
+    let s = |n: &str| format::sanitize_file_name(n).as_str().to_owned();
+    assert_eq!(s("C:\\dir\\a\u{7}.txt"), "a_.txt");
+    assert_eq!(s("/etc/passwd"), "passwd");
     for n in ["", ".", "..", "dir/"] {
-        assert_eq!(format::sanitize_file_name(n), "file");
+        assert_eq!(s(n), "file");
     }
     assert!(format::sanitize_file_name(&"я".repeat(200)).len() <= 255);
 }

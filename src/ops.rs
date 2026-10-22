@@ -211,13 +211,25 @@ impl Client {
         } else {
             ""
         };
+        // Built in wiped buffers reserved up front: no reallocation leaves a copy of the key.
+        let link = |kind: &str, extra: usize| {
+            let mut l = Zeroizing::new(String::with_capacity(
+                self.origin.as_str().len() + kind.len() + id.len() + 1 + extra,
+            ));
+            l.push_str(self.origin.as_str());
+            l.push_str(kind);
+            l.push_str(id);
+            l.push('#');
+            l
+        };
+        let mut recipient = link("/s/", 44 + suffix.len());
+        format::push_key(&mut recipient, &k_url);
+        recipient.push_str(suffix);
+        let mut owner = link("/o/", token.len());
+        owner.push_str(token);
         Ok(Created {
-            recipient: Zeroizing::new(format!(
-                "{}/s/{id}#{}{suffix}",
-                self.origin.as_str(),
-                format::encode_base64url(&*k_url)
-            )),
-            owner: Zeroizing::new(format!("{}/o/{id}#{token}", self.origin.as_str())),
+            recipient,
+            owner,
             expires: api::printable(expires),
         })
     }

@@ -76,9 +76,10 @@ pub enum NewFocus {
     Back,
 }
 
+/// A file to send; its path and name are part of the secret, kept in wiped buffers.
 pub struct PickedFile {
-    pub path: PathBuf,
-    pub name: String,
+    pub path: Zeroizing<String>,
+    pub name: Zeroizing<String>,
     pub size: u64,
 }
 
@@ -1307,7 +1308,7 @@ impl App {
                     let saved = if typed.is_empty() {
                         save::save_dir_default(&v.id, &entries)
                     } else {
-                        let dir = expand_home(&typed);
+                        let dir = PathBuf::from(expand_home(&typed).as_str());
                         save::write_dir(&dir, &entries).map(|_| dir)
                     };
                     saved.map(|dir| (dir, entries.len()))
@@ -1491,19 +1492,20 @@ fn add_file(f: &mut NewForm) -> Result<(), String> {
         return Err(format!("Too many files: at most {}.", format::MAX_FILES));
     }
     let path = expand_home(raw);
-    let meta = std::fs::metadata(&path).map_err(|_| "No such file.".to_string())?;
+    let meta = std::fs::metadata(path.as_str()).map_err(|_| "No such file.".to_string())?;
     if !meta.is_file() {
         return Err("Not a regular file.".into());
     }
     if meta.len() == 0 {
         return Err("The file is empty.".into());
     }
-    let raw_name = path
+    // The path is UTF-8 (typed in the field): the name is borrowed from it, not copied.
+    let name = std::path::Path::new(path.as_str())
         .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
     f.files.push(PickedFile {
-        name: format::sanitize_file_name(&raw_name),
+        name: format::sanitize_file_name(name),
         size: meta.len(),
         path,
     });
@@ -1512,11 +1514,20 @@ fn add_file(f: &mut NewForm) -> Result<(), String> {
     Ok(())
 }
 
-fn expand_home(p: &str) -> PathBuf {
-    match (p.strip_prefix("~/"), std::env::var_os("HOME")) {
-        (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
-        _ => PathBuf::from(p),
+/// `~/` expanded to the home directory, in a wiped buffer reserved up front.
+fn expand_home(p: &str) -> Zeroizing<String> {
+    let home = std::env::var("HOME").ok();
+    let (home, rest) = match (p.strip_prefix("~/"), home.as_deref()) {
+        (Some(rest), Some(home)) => (home.trim_end_matches('/'), rest),
+        _ => ("", p),
+    };
+    let mut out = Zeroizing::new(String::with_capacity(home.len() + 1 + rest.len()));
+    if !home.is_empty() {
+        out.push_str(home);
+        out.push('/');
     }
+    out.push_str(rest);
+    out
 }
 
 /// Read the files, compose the one record (FORMAT.md 4), encrypt and create; also the limit the
@@ -1525,7 +1536,7 @@ fn create(f: &mut NewForm, client: &mut Client) -> Result<(CreatedView, usize), 
     let files = f
         .files
         .iter()
-        .map(|p| crate::commands::read_file_secret(&p.path))
+        .map(|p| crate::commands::read_file_secret(std::path::Path::new(p.path.as_str())))
         .collect::<Result<Vec<_>, _>>()?;
     let content = format::compose(
         f.text.text(),
