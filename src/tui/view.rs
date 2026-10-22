@@ -871,7 +871,7 @@ fn render_revealed(f: &mut Frame, area: Rect, v: &RevealedView, hits: &mut Hits)
             .iter()
             .skip(top)
             .take(h)
-            .map(|(n, s)| (shown_name(n), *s))
+            .map(|(n, s)| (crate::api::printable_secret(n), *s))
             .collect();
         let lines: Vec<Line> = shown
             .iter()
@@ -910,16 +910,6 @@ fn render_revealed(f: &mut Frame, area: Rect, v: &RevealedView, hits: &mut Hits)
     }
     col.take(1);
     buttons_row(f, col.take(brows), &buttons, focus_at, first, hits);
-}
-
-/// A received file name for the screen: control characters as `?`, in a buffer reserved up front
-/// (a replacement is never longer than the character), so no reallocation leaves copies.
-fn shown_name(name: &str) -> Zeroizing<String> {
-    let mut s = Zeroizing::new(String::with_capacity(name.len()));
-    for c in name.chars() {
-        s.push(if c.is_control() { '?' } else { c });
-    }
-    s
 }
 
 fn render_status(f: &mut Frame, area: Rect, v: &StatusView, hits: &mut Hits) {

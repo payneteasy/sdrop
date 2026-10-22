@@ -120,6 +120,16 @@ pub fn printable(s: &str) -> String {
         .collect()
 }
 
+/// `printable` for a part of the secret (a sender's file name): the same characters, in a wiped
+/// buffer reserved up front (a replacement is never longer than the character it replaces).
+pub fn printable_secret(s: &str) -> Zeroizing<String> {
+    let mut out = Zeroizing::new(String::with_capacity(s.len()));
+    for c in s.chars().take(80) {
+        out.push(if c.is_control() { '?' } else { c });
+    }
+    out
+}
+
 /// `{origin}/{kind}/{id}#{fragment}`: exact origin match, id is 64 lowercase hex.
 fn split_link<'a>(
     origin: &Origin,
@@ -305,6 +315,16 @@ pub fn http_error(what: &str, status: u16) -> CliError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn printable_secret_matches_printable_without_regrowing() {
+        for s in ["plain.txt", "a\u{9b}b\u{7f}c\u{1}", &"я".repeat(100), ""] {
+            let p = printable_secret(s);
+            assert_eq!(p.as_str(), printable(s), "{s:?}");
+            assert!(p.capacity() >= s.len() && p.len() <= s.len());
+        }
+        assert_eq!(printable_secret("x\u{9b}y").as_str(), "x?y");
+    }
 
     #[test]
     fn origin_rules() {

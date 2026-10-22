@@ -342,7 +342,7 @@ fn deliver_bundle(
                         "  file-{}  ({}) the sender named it \"{}\"",
                         i + 1,
                         human_size(data.len()),
-                        api::printable(name)
+                        api::printable_secret(name).as_str()
                     );
                 }
                 return Ok(());
@@ -385,9 +385,8 @@ fn deliver(secret: Secret, out: Option<&Path>, id: &str) -> Result<(), CliError>
         None if name.is_none() => Dest::Stdout,
         None => Dest::Default,
     };
-    let sender = name
-        .map(|n| format!(" The sender named it \"{}\".", api::printable(n)))
-        .unwrap_or_default();
+    // The name is part of the secret: shown from a wiped buffer, written straight to stderr.
+    let sender = name.map(api::printable_secret);
     let mut tried_default = false;
     loop {
         let (shown, result) = match &dest {
@@ -414,9 +413,16 @@ fn deliver(secret: Secret, out: Option<&Path>, id: &str) -> Result<(), CliError>
         match result {
             Ok(p) => {
                 note!(
-                    "Saved to {} ({}).{sender}",
+                    "Saved to {} ({}).{}{}{}",
                     api::printable(&p.display().to_string()),
-                    human_size(bytes.len())
+                    human_size(bytes.len()),
+                    if sender.is_some() {
+                        " The sender named it \""
+                    } else {
+                        ""
+                    },
+                    sender.as_deref().map_or("", |s| s.as_str()),
+                    if sender.is_some() { "\"." } else { "" }
                 );
                 return Ok(());
             }
