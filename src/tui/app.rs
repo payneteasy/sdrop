@@ -456,6 +456,8 @@ impl App {
             }
             return;
         }
+        // The terminal may have grown since the scroll was set: clamp the state, not only the view.
+        v.scroll = v.scroll.min(v.max_scroll.get());
         match k.code {
             KeyCode::Up => v.scroll = v.scroll.saturating_sub(1),
             KeyCode::Down => v.scroll = (v.scroll + 1).min(v.max_scroll.get()),
@@ -986,12 +988,21 @@ fn render_input(f: &mut Frame, area: Rect, input: &Input, title: &str, focused: 
     let dx = col.saturating_sub(w.saturating_sub(1));
     // Only the visible window is handed to ratatui (slices of the text, no copies): offsets of any
     // size work, unlike Paragraph::scroll with its u16 offsets.
+    // The cells actually skipped on the cursor's line (a wide grapheme at the edge goes whole).
+    let mut skipped = dx;
     let visible: Vec<Line> = input
         .text()
         .split('\n')
+        .enumerate()
         .skip(dy)
         .take(h.max(1))
-        .map(|l| Line::raw(skip_cols(l, dx)))
+        .map(|(n, l)| {
+            let (rest, cut) = skip_cols(l, dx);
+            if n == line {
+                skipped = cut;
+            }
+            Line::raw(rest)
+        })
         .collect();
     f.render_widget(
         Paragraph::new(visible).block(focused_block(title, focused)),
@@ -999,7 +1010,7 @@ fn render_input(f: &mut Frame, area: Rect, input: &Input, title: &str, focused: 
     );
     if focused && w > 0 && h > 0 {
         f.set_cursor_position(Position {
-            x: area.x + 1 + (col - dx) as u16,
+            x: area.x + 1 + col.saturating_sub(skipped) as u16,
             y: area.y + 1 + (line - dy) as u16,
         });
     }
@@ -1012,7 +1023,7 @@ fn wrapped(text: &str, width: usize) -> impl Iterator<Item = &str> {
         let mut pieces = Vec::new();
         let (mut start, mut cells) = (0, 0);
         for (i, g) in unicode_segmentation::UnicodeSegmentation::grapheme_indices(line, true) {
-            let gw = unicode_width::UnicodeWidthStr::width(g);
+            let gw = super::input::cells(g);
             if cells + gw > width && i > start {
                 pieces.push(&line[start..i]);
                 start = i;
@@ -1025,17 +1036,17 @@ fn wrapped(text: &str, width: usize) -> impl Iterator<Item = &str> {
     })
 }
 
-/// The part of a line after its first `cols` terminal cells, cut at grapheme boundaries and
-/// measured as `Input::line_col` measures the cursor.
-fn skip_cols(line: &str, cols: usize) -> &str {
+/// The part of a line after its first `cols` terminal cells, cut at grapheme boundaries (a wide
+/// grapheme straddling the edge is skipped whole), and the cells actually skipped.
+fn skip_cols(line: &str, cols: usize) -> (&str, usize) {
     let mut seen = 0;
     for (i, g) in unicode_segmentation::UnicodeSegmentation::grapheme_indices(line, true) {
         if seen >= cols {
-            return &line[i..];
+            return (&line[i..], seen);
         }
-        seen += unicode_width::UnicodeWidthStr::width(g);
+        seen += super::input::cells(g);
     }
-    ""
+    ("", seen)
 }
 
 fn render_new(f: &mut Frame, area: Rect, form: &NewForm) {
@@ -1553,6 +1564,52 @@ pub mod tests {
         assert!(
             screen_text(&app).contains("tttt"),
             "one page up from the end is still text"
+        );
+        // Over-scrolled state (e.g. the terminal grew): the first Up moves the view at once.
+        if let Screen::Revealed(v) = &mut app.screen {
+            v.scroll = 10_000;
+        }
+        let before = screen_text(&app);
+        app.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_ne!(screen_text(&app), before);
+    }
+
+    #[test]
+    fn halfwidth_marks_wrap_without_losing_text() {
+        let mut app = App::new(Box::new(MemClip::default()));
+        app.reveal(
+            "0".repeat(64),
+            Secret::Text(Zeroizing::new(format!("{}END", "ｶﾞ".repeat(98)))),
+        );
+        let mut seen = String::new();
+        for _ in 0..5 {
+            seen.push_str(&screen_text(&app));
+            app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        let shown = seen.matches("ｶﾞ").count();
+        assert!(shown >= 98, "{shown} of 98 shown");
+        assert!(seen.contains("END"));
+    }
+
+    #[test]
+    fn cursor_after_a_wide_grapheme_at_the_scroll_edge() {
+        let mut app = App::new(Box::new(MemClip::default()));
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let Screen::New(f) = &mut app.screen else {
+            unreachable!()
+        };
+        f.focus = NewFocus::Path;
+        app.paste(&format!("{}AB", "界".repeat(50)));
+        app.key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        app.key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        t.draw(|f| app.render(f)).unwrap();
+        let pos = t.get_cursor_position().unwrap();
+        let buf = t.backend().buffer().clone();
+        assert_eq!(
+            buf[(pos.x, pos.y)].symbol(),
+            "A",
+            "the cursor is on A, where typing inserts"
         );
     }
 

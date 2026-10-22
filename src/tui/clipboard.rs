@@ -51,6 +51,8 @@ fn clear_if_same(hash: [u8; 32]) {
 pub struct SystemClip {
     board: Option<arboard::Clipboard>,
     ssh: bool,
+    /// Generation of the latest scheduled removal: an older timer leaves a newer copy alone.
+    generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl SystemClip {
@@ -64,6 +66,7 @@ impl SystemClip {
                 arboard::Clipboard::new().ok()
             },
             ssh,
+            generation: Default::default(),
         }
     }
 }
@@ -115,17 +118,39 @@ impl Clip for SystemClip {
 
     fn schedule_clear(&mut self, hash: [u8; 32], delay: std::time::Duration) {
         if self.board.is_some() {
+            let generation = self.generation.clone();
+            let mine = generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
             std::thread::spawn(move || {
                 std::thread::sleep(delay);
-                clear_if_same(hash);
+                if is_current(&generation, mine) {
+                    clear_if_same(hash);
+                }
             });
         }
     }
 }
 
+/// The timer of generation `mine` is still the latest one.
+fn is_current(generation: &std::sync::atomic::AtomicU64, mine: u64) -> bool {
+    generation.load(std::sync::atomic::Ordering::SeqCst) == mine
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_older_timer_is_not_current() {
+        let g = std::sync::atomic::AtomicU64::new(0);
+        let first = g.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        assert!(is_current(&g, first));
+        let second = g.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        assert!(
+            !is_current(&g, first),
+            "copied again: the first timer leaves it alone"
+        );
+        assert!(is_current(&g, second));
+    }
 
     #[test]
     fn osc52_sequence() {

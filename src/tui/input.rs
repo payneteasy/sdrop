@@ -3,6 +3,17 @@
 
 use zeroize::Zeroizing;
 
+/// Terminal cells of one grapheme, as ratatui lays it out (its `CellWidth`, which also counts the
+/// halfwidth sound marks U+FF9E/U+FF9F); control characters are not drawn by ratatui: none.
+pub fn cells(g: &str) -> usize {
+    use ratatui::buffer::CellWidth;
+    if g.chars().all(char::is_control) {
+        0
+    } else {
+        g.cell_width() as usize
+    }
+}
+
 pub struct Input {
     text: Zeroizing<String>,
     /// Cursor position in chars.
@@ -161,7 +172,7 @@ impl Input {
         let start = before.rfind('\n').map_or(0, |i| i + 1);
         // Grapheme by grapheme, as ratatui lays out cells (and as `skip_cols` scrolls).
         let width = unicode_segmentation::UnicodeSegmentation::graphemes(&before[start..], true)
-            .map(unicode_width::UnicodeWidthStr::width)
+            .map(cells)
             .sum::<usize>();
         (line, width)
     }
@@ -214,6 +225,9 @@ mod tests {
         i.insert("界a");
         assert_eq!(i.line_col(), (0, 3));
         i.set("e\u{301}x");
+        assert_eq!(i.line_col(), (0, 2));
+        // Halfwidth katakana with a voiced sound mark: two cells, as ratatui draws it.
+        i.set("ｶﾞ");
         assert_eq!(i.line_col(), (0, 2));
         // An emoji ZWJ sequence and a skin tone modifier take two cells each.
         i.set("👨\u{200d}👩\u{200d}👧\u{200d}👦x");
