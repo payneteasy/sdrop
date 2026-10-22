@@ -122,6 +122,8 @@ pub struct RevealedView {
     pub id: String,
     pub secret: Secret,
     pub scroll: usize,
+    /// Last page start as of the last frame, so that keys stop scrolling at the end.
+    pub max_scroll: std::cell::Cell<usize>,
     /// Typing the directory to save into.
     pub saving: bool,
     pub dir: Input,
@@ -270,9 +272,12 @@ impl App {
         match self.clip.copy(text) {
             Ok(Via::System) => {
                 if secret {
+                    let hash: [u8; 32] = Sha256::digest(text.as_bytes()).into();
+                    // Also on its own thread: a blocking request in the event loop cannot delay it.
+                    self.clip.schedule_clear(hash, CLEAR_AFTER);
                     self.clear = Some(PendingClear {
                         at: self.now + CLEAR_AFTER,
-                        hash: Sha256::digest(text.as_bytes()).into(),
+                        hash,
                     });
                     self.note(format!("{what} copied; it is removed from the clipboard in 60 seconds."));
                 } else {
@@ -414,7 +419,10 @@ impl App {
             Screen::Revealed(_) => self.key_revealed(k),
             Screen::Status(v) => match k.code {
                 KeyCode::Esc | KeyCode::Char('q') => self.screen = Screen::Home { selected: 0 },
-                KeyCode::Char('r') => self.pending = Some(Op::RefreshStatus),
+                KeyCode::Char('r') => {
+                    v.confirm_revoke = false;
+                    self.pending = Some(Op::RefreshStatus);
+                }
                 KeyCode::Char('x') if v.status.state == "stored" => {
                     if v.confirm_revoke {
                         v.confirm_revoke = false;
@@ -450,9 +458,9 @@ impl App {
         }
         match k.code {
             KeyCode::Up => v.scroll = v.scroll.saturating_sub(1),
-            KeyCode::Down => v.scroll += 1,
+            KeyCode::Down => v.scroll = (v.scroll + 1).min(v.max_scroll.get()),
             KeyCode::PageUp => v.scroll = v.scroll.saturating_sub(10),
-            KeyCode::PageDown => v.scroll += 10,
+            KeyCode::PageDown => v.scroll = (v.scroll + 10).min(v.max_scroll.get()),
             KeyCode::Char('c') if !v.text().is_empty() => {
                 let text = Zeroizing::new(v.text().to_owned());
                 self.copy(&text, "The secret", true);
@@ -744,12 +752,13 @@ impl App {
         }
     }
 
-    fn reveal(&mut self, id: String, secret: Secret) {
+    pub fn reveal(&mut self, id: String, secret: Secret) {
         let has_files = !matches!(secret, Secret::Text(_));
         self.screen = Screen::Revealed(Box::new(RevealedView {
             id,
             secret,
             scroll: 0,
+            max_scroll: std::cell::Cell::new(0),
             saving: false,
             dir: Input::new(false),
             saved: None,
@@ -996,14 +1005,35 @@ fn render_input(f: &mut Frame, area: Rect, input: &Input, title: &str, focused: 
     }
 }
 
-/// The part of a line after its first `cols` terminal cells.
+/// Screen lines of `text` at `width` cells: each line cut into pieces at grapheme boundaries
+/// (slices of the text, no copies).
+fn wrapped(text: &str, width: usize) -> impl Iterator<Item = &str> {
+    text.split('\n').flat_map(move |line| {
+        let mut pieces = Vec::new();
+        let (mut start, mut cells) = (0, 0);
+        for (i, g) in unicode_segmentation::UnicodeSegmentation::grapheme_indices(line, true) {
+            let gw = unicode_width::UnicodeWidthStr::width(g);
+            if cells + gw > width && i > start {
+                pieces.push(&line[start..i]);
+                start = i;
+                cells = 0;
+            }
+            cells += gw;
+        }
+        pieces.push(&line[start..]);
+        pieces
+    })
+}
+
+/// The part of a line after its first `cols` terminal cells, cut at grapheme boundaries and
+/// measured as `Input::line_col` measures the cursor.
 fn skip_cols(line: &str, cols: usize) -> &str {
     let mut seen = 0;
-    for (i, c) in line.char_indices() {
+    for (i, g) in unicode_segmentation::UnicodeSegmentation::grapheme_indices(line, true) {
         if seen >= cols {
             return &line[i..];
         }
-        seen += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        seen += unicode_width::UnicodeWidthStr::width(g);
     }
     ""
 }
@@ -1194,12 +1224,18 @@ fn render_revealed(f: &mut Frame, area: Rect, v: &RevealedView) {
     ])
     .areas(area);
     if !v.text().is_empty() {
-        let h = text.height.saturating_sub(2) as usize;
-        let lines: Vec<Line> = v
-            .text()
-            .split('\n')
-            .skip(v.scroll)
-            .take(h.max(1))
+        // Wrapped at the field width by graphemes (exact for tokens and keys) and scrolled by
+        // screen lines; the scroll stops at the last page.
+        let (w, h) = (
+            text.width.saturating_sub(2).max(1) as usize,
+            text.height.saturating_sub(2).max(1) as usize,
+        );
+        let total = wrapped(v.text(), w).count();
+        let max = total.saturating_sub(h);
+        v.max_scroll.set(max);
+        let lines: Vec<Line> = wrapped(v.text(), w)
+            .skip(v.scroll.min(max))
+            .take(h)
             .map(Line::raw)
             .collect();
         f.render_widget(
@@ -1333,10 +1369,14 @@ pub mod tests {
     use ratatui::backend::TestBackend;
     use std::sync::{Arc, Mutex};
 
+    type Scheduled = Arc<Mutex<Vec<([u8; 32], Duration)>>>;
+
     /// Clipboard in memory: what was copied and whether it is the system one.
     #[derive(Clone, Default)]
     pub struct MemClip {
         pub value: Arc<Mutex<Option<String>>>,
+        /// Background removals asked for: (hash, delay).
+        pub scheduled: Scheduled,
         pub terminal: bool,
         /// The clipboard is temporarily unavailable.
         pub down: Arc<Mutex<bool>>,
@@ -1363,6 +1403,9 @@ pub mod tests {
             }
             *self.value.lock().unwrap() = None;
             Ok(())
+        }
+        fn schedule_clear(&mut self, hash: [u8; 32], delay: Duration) {
+            self.scheduled.lock().unwrap().push((hash, delay));
         }
     }
 
@@ -1404,14 +1447,23 @@ pub mod tests {
         assert_eq!(*clip.value.lock().unwrap(), None, "first press only warns");
         app.copy("link", "The link", false);
         assert_eq!(clip.value.lock().unwrap().as_deref(), Some("link"));
+        assert!(
+            clip.scheduled.lock().unwrap().is_empty(),
+            "links are not removed"
+        );
         app.tick(t0 + CLEAR_AFTER * 2);
         assert_eq!(
             clip.value.lock().unwrap().as_deref(),
             Some("link"),
             "links stay"
         );
-        // A secret text is removed after 60 s, even after leaving the screen.
+        // A secret text is removed after 60 s, even after leaving the screen; the removal is also
+        // scheduled on its own thread, so a blocking request cannot delay it.
         app.copy("s3cret", "The secret", true);
+        assert_eq!(
+            *clip.scheduled.lock().unwrap(),
+            [(<[u8; 32]>::from(Sha256::digest(b"s3cret")), CLEAR_AFTER)]
+        );
         app.screen = Screen::Home { selected: 0 };
         app.tick(t0 + CLEAR_AFTER * 2 + Duration::from_secs(59));
         assert_eq!(clip.value.lock().unwrap().as_deref(), Some("s3cret"));
@@ -1473,6 +1525,35 @@ pub mod tests {
         f.text.clear();
         app.paste(&format!("{}TAIL-OF-70K", "y".repeat(70_000)));
         assert!(screen_text(&app).contains("TAIL-OF-70K"));
+        // Emoji ZWJ sequences: the window and the cursor agree, the tail stays visible.
+        let Screen::New(f) = &mut app.screen else {
+            unreachable!()
+        };
+        f.text.clear();
+        app.paste(&format!(
+            "{}TAIL-EMOJI",
+            "👨\u{200d}👩\u{200d}👧\u{200d}👦".repeat(100)
+        ));
+        assert!(screen_text(&app).contains("TAIL-EMOJI"));
+    }
+
+    #[test]
+    fn long_revealed_line_wraps_and_scrolls_to_the_end() {
+        let mut app = App::new(Box::new(MemClip::default()));
+        let token = format!("{}END-OF-TOKEN", "t".repeat(5000));
+        app.reveal("0".repeat(64), Secret::Text(Zeroizing::new(token)));
+        assert!(!screen_text(&app).contains("END-OF-TOKEN"));
+        // Keys use the page size known from the last frame; scrolling past the end stops there.
+        for _ in 0..10 {
+            screen_text(&app);
+            app.key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        }
+        assert!(screen_text(&app).contains("END-OF-TOKEN"));
+        app.key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert!(
+            screen_text(&app).contains("tttt"),
+            "one page up from the end is still text"
+        );
     }
 
     #[test]

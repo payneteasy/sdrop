@@ -159,10 +159,11 @@ impl Input {
         let before = &self.text[..at];
         let line = before.matches('\n').count();
         let start = before.rfind('\n').map_or(0, |i| i + 1);
-        (
-            line,
-            unicode_width::UnicodeWidthStr::width(&before[start..]),
-        )
+        // Grapheme by grapheme, as ratatui lays out cells (and as `skip_cols` scrolls).
+        let width = unicode_segmentation::UnicodeSegmentation::graphemes(&before[start..], true)
+            .map(unicode_width::UnicodeWidthStr::width)
+            .sum::<usize>();
+        (line, width)
     }
 }
 

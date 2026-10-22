@@ -1982,8 +1982,13 @@ mod tui_open {
         assert!(app.message.as_ref().unwrap().1.contains("still here"));
         assert!(!ro.join("x").exists());
         let good = std::env::temp_dir().join(format!("sdrop-tok-{}", rand_suffix()));
-        if let Screen::Revealed(v) = &mut app.screen {
-            v.dir.clear();
+        // Ctrl+C with unsaved files: the first press only warns.
+        app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(!app.quit);
+        // The failed path stays in the open field: the user erases it with Backspace and types
+        // another one.
+        for _ in 0..ro.join("x").to_str().unwrap().chars().count() {
+            app.key(key(KeyCode::Backspace));
         }
         app.paste(good.to_str().unwrap());
         app.key(key(KeyCode::Enter));
@@ -2042,6 +2047,11 @@ mod tui_open {
         assert_eq!(state(&app), "stored");
         app.key(key(KeyCode::Char('x')));
         assert!(app.pending.is_none(), "first x only asks");
+        // Checking the status in between cancels the question: x asks again.
+        app.key(key(KeyCode::Char('r')));
+        app.perform(&mut c);
+        app.key(key(KeyCode::Char('x')));
+        assert!(app.pending.is_none(), "after r, x asks again");
         app.key(key(KeyCode::Char('x')));
         app.perform(&mut c);
         assert_eq!(state(&app), "revoked");
@@ -2049,7 +2059,7 @@ mod tui_open {
         app.key(key(KeyCode::Char('r')));
         app.perform(&mut c);
         let methods: Vec<_> = f.requests().iter().map(|q| q.method.clone()).collect();
-        assert_eq!(methods, ["GET", "DELETE", "GET", "GET"]);
+        assert_eq!(methods, ["GET", "GET", "DELETE", "GET", "GET"]);
         for q in f.requests() {
             assert!(
                 q.headers

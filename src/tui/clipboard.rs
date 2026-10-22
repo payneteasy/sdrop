@@ -23,6 +23,29 @@ pub trait Clip {
     /// unavailable right now (then a pending removal is retried, not dropped).
     fn read(&mut self) -> Result<Option<Zeroizing<String>>, Unavailable>;
     fn clear(&mut self) -> Result<(), Unavailable>;
+    /// Remove the text with this SHA-256 after `delay`, independently of the caller's thread.
+    fn schedule_clear(&mut self, _hash: [u8; 32], _delay: std::time::Duration) {}
+}
+
+/// Remove the copied text if the clipboard still holds it; retried while the clipboard is
+/// unavailable (bounded: about five minutes).
+fn clear_if_same(hash: [u8; 32]) {
+    use sha2::{Digest, Sha256};
+    for _ in 0..60 {
+        if let Ok(mut b) = arboard::Clipboard::new() {
+            match b.get_text() {
+                Ok(t) => {
+                    let t = Zeroizing::new(t);
+                    if <[u8; 32]>::from(Sha256::digest(t.as_bytes())) != hash || b.clear().is_ok() {
+                        return;
+                    }
+                }
+                Err(arboard::Error::ContentNotAvailable) => return,
+                Err(_) => {}
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(5));
+    }
 }
 
 pub struct SystemClip {
@@ -88,6 +111,15 @@ impl Clip for SystemClip {
             .ok_or(Unavailable)?
             .clear()
             .map_err(|_| Unavailable)
+    }
+
+    fn schedule_clear(&mut self, hash: [u8; 32], delay: std::time::Duration) {
+        if self.board.is_some() {
+            std::thread::spawn(move || {
+                std::thread::sleep(delay);
+                clear_if_same(hash);
+            });
+        }
     }
 }
 
