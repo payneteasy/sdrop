@@ -1877,13 +1877,13 @@ mod tui_open {
     fn wrong_kind_of_link_explains_and_sends_nothing() {
         let f = never_called();
         let mut c = client(&f);
-        let key = "A".repeat(43);
+        let k43 = "A".repeat(43);
         // A recipient link pasted into Check status: never consumed, the message says what to use.
         let mut app = App::new(Box::new(MemClip::default()));
         app.key(key(KeyCode::Down));
         app.key(key(KeyCode::Down));
         app.key(key(KeyCode::Enter));
-        app.paste(&format!("{}/s/{ID}#{key}", f.origin));
+        app.paste(&format!("{}/s/{ID}#{k43}", f.origin));
         app.key(key(KeyCode::Enter));
         app.perform(&mut c);
         assert!(matches!(app.screen, Screen::StatusForm(_)));
@@ -1894,7 +1894,7 @@ mod tui_open {
         );
         // A status link pasted into Open a link.
         let app = opened(
-            &format!("{}/o/{ID}#{key}", f.origin),
+            &format!("{}/o/{ID}#{k43}", f.origin),
             &mut c,
             MemClip::default(),
         );
