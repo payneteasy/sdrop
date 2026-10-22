@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use sdrop::commands::{self, PutArgs};
 use std::io::Write;
 use std::path::PathBuf;
@@ -8,12 +8,15 @@ use std::process::ExitCode;
 #[derive(Parser)]
 #[command(name = "sdrop", version)]
 struct Cli {
+    /// Without a command on a terminal: the interactive mode (`sdrop tui`).
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Interactive mode: create, open and track secrets in the terminal.
+    Tui,
     /// Encrypt a secret from FILE or stdin; recipient link to stdout, owner link to stderr.
     Put {
         /// Delete after this time if nobody opens it: 1h, 24h or 7d.
@@ -49,7 +52,16 @@ enum Cmd {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let result = match &cli.cmd {
+    let Some(cmd) = &cli.cmd else {
+        use std::io::IsTerminal;
+        if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+            return finish(sdrop::tui::run());
+        }
+        let _ = Cli::command().print_help();
+        return ExitCode::from(2);
+    };
+    let result = match cmd {
+        Cmd::Tui => sdrop::tui::run(),
         Cmd::Put {
             ttl,
             passphrase,
@@ -92,6 +104,10 @@ fn main() -> ExitCode {
             .and_then(|u| commands::revoke(&u))
             .and_then(|s| commands::write_stdout(&s)),
     };
+    finish(result)
+}
+
+fn finish(result: Result<(), sdrop::api::CliError>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

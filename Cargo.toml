@@ -16,9 +16,11 @@ test-loopback = []
 aes-gcm = { version = "0.11.1", features = ["zeroize"] }
 base64 = "0.23.1"
 clap = { version = "4.6.7", features = ["derive"] }
+crossterm = "0.29.0"
 getrandom = "0.4.3"
 hkdf = "0.13.0"
 pbkdf2 = "0.13.0"
+ratatui = "0.30.2"
 rpassword = "7.5.4"
 serde_json = "1.0.154"
 sha2 = { version = "0.11.1", features = ["zeroize"] }

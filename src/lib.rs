@@ -5,3 +5,4 @@ pub mod commands;
 pub mod format;
 pub mod ops;
 pub mod save;
+pub mod tui;
