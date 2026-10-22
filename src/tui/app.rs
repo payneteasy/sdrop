@@ -529,11 +529,8 @@ impl App {
                 v.saving = true;
                 v.dir.clear();
             }
-            KeyCode::Esc => {
-                if self.may_leave() {
-                    self.screen = Screen::Home { selected: 0 };
-                }
-            }
+            // may_leave warns on the first press when unsaved files would be lost.
+            KeyCode::Esc if self.may_leave() => self.screen = Screen::Home { selected: 0 },
             _ => {}
         }
     }
@@ -611,13 +608,11 @@ impl App {
             NewFocus::Files => match k.code {
                 KeyCode::Up => f.file_sel = f.file_sel.saturating_sub(1),
                 KeyCode::Down => f.file_sel = (f.file_sel + 1).min(f.files.len().saturating_sub(1)),
-                KeyCode::Delete | KeyCode::Backspace => {
-                    if f.file_sel < f.files.len() {
-                        f.files.remove(f.file_sel);
-                        f.file_sel = f.file_sel.min(f.files.len().saturating_sub(1));
-                        if f.files.is_empty() {
-                            f.focus = NewFocus::Path;
-                        }
+                KeyCode::Delete | KeyCode::Backspace if f.file_sel < f.files.len() => {
+                    f.files.remove(f.file_sel);
+                    f.file_sel = f.file_sel.min(f.files.len().saturating_sub(1));
+                    if f.files.is_empty() {
+                        f.focus = NewFocus::Path;
                     }
                 }
                 _ => {}
