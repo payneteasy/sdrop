@@ -14,6 +14,7 @@ test-loopback = []
 
 [dependencies]
 aes-gcm = { version = "0.11.1", features = ["zeroize"] }
+arboard = { version = "3.7.0", default-features = false }
 base64 = "0.23.1"
 clap = { version = "4.6.7", features = ["derive"] }
 crossterm = "0.29.0"

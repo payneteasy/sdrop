@@ -1,6 +1,7 @@
 //! Interactive mode: `sdrop tui`, or `sdrop` without arguments on a terminal (README).
 
 pub mod app;
+pub mod clipboard;
 pub mod input;
 pub mod term;
 
@@ -11,12 +12,12 @@ use std::time::Duration;
 use zeroize::Zeroizing;
 
 pub fn run() -> Result<(), CliError> {
-    // The configured origin is checked before the terminal is taken over.
-    crate::api::Origin::configured()?;
+    // The configured origin is checked (Client::new) before the terminal is taken over.
     let mut guard =
         term::Guard::enter().map_err(|_| CliError::Msg("cannot open the terminal".into()))?;
     let io = |_| CliError::Msg("terminal error".into());
-    let mut app = App::new();
+    let mut client = crate::ops::Client::new(false)?;
+    let mut app = App::new(Box::new(clipboard::SystemClip::new()));
     #[cfg(feature = "test-loopback")]
     if let Ok(m) = std::env::var("SDROP_TEST_TUI_MARKER") {
         app.message = Some((false, m));
@@ -26,8 +27,14 @@ pub fn run() -> Result<(), CliError> {
         #[cfg(feature = "test-loopback")]
         test_exit(&app)?;
         if app.quit {
+            app.on_quit();
             return Ok(());
         }
+        if app.pending.is_some() {
+            app.perform(&mut client);
+            continue;
+        }
+        app.tick(std::time::Instant::now());
         if !event::poll(Duration::from_millis(500)).map_err(io)? {
             continue;
         }

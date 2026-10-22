@@ -150,8 +150,8 @@ pub struct PutArgs<'a> {
     pub files: &'a [PathBuf],
 }
 
-/// File for `put --file`: bytes and the sanitized name.
-fn read_file_secret(p: &Path) -> Result<(String, Zeroizing<Vec<u8>>), CliError> {
+/// File for `put --file` and the TUI: bytes and the sanitized name.
+pub fn read_file_secret(p: &Path) -> Result<(String, Zeroizing<Vec<u8>>), CliError> {
     let shown = api::printable(&p.display().to_string());
     let mut buf = Zeroizing::new(Vec::new());
     std::fs::File::open(p)

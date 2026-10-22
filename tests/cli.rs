@@ -1619,3 +1619,186 @@ fn local_checks_come_before_reading_the_access_token() {
     }
     assert_eq!(f.requests().len(), 0);
 }
+
+// ---------- Interactive mode: New secret (README, "Interactive mode") ----------
+
+mod tui_create {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use sdrop::tui::app::{App, NewFocus, Screen};
+    use sdrop::tui::clipboard::{Clip, Via};
+    use zeroize::Zeroizing;
+
+    struct NoClip;
+    impl Clip for NoClip {
+        fn copy(&mut self, _: &str) -> Result<Via, String> {
+            Ok(Via::System)
+        }
+        fn read(&mut self) -> Option<Zeroizing<String>> {
+            None
+        }
+        fn clear(&mut self) {}
+    }
+
+    fn key(c: KeyCode) -> KeyEvent {
+        KeyEvent::new(c, KeyModifiers::NONE)
+    }
+
+    fn client(f: &Fake) -> sdrop::ops::Client {
+        sdrop::ops::Client::with_origin(sdrop::api::Origin::parse(&f.origin).unwrap(), false)
+    }
+
+    fn new_app() -> App {
+        let mut app = App::new(Box::new(NoClip));
+        app.key(key(KeyCode::Enter));
+        app
+    }
+
+    fn focus(app: &mut App, to: NewFocus) {
+        for _ in 0..10 {
+            if let Screen::New(f) = &app.screen
+                && f.focus == to
+            {
+                return;
+            }
+            app.key(key(KeyCode::Tab));
+        }
+        panic!("focus {to:?} not reached");
+    }
+
+    fn created(app: &App) -> (String, String) {
+        match &app.screen {
+            Screen::Created(v) => (v.recipient.to_string(), v.owner.to_string()),
+            _ => panic!("not created: {:?}", app.message),
+        }
+    }
+
+    #[test]
+    fn text_creates_one_secret_with_cli_links() {
+        let f = serving_with_limit(vec![], 262144);
+        let mut c = client(&f);
+        let mut app = new_app();
+        app.paste("hello tui\nline 2");
+        focus(&mut app, NewFocus::Create);
+        app.key(key(KeyCode::Enter));
+        app.perform(&mut c);
+        let (recipient, owner) = created(&app);
+        assert!(
+            recipient.starts_with(&format!("{}/s/{ID}#", f.origin)),
+            "{recipient}"
+        );
+        assert!(
+            owner.starts_with(&format!("{}/o/{ID}#", f.origin)),
+            "{owner}"
+        );
+        let reqs = f.requests();
+        assert_eq!(
+            reqs.iter().map(|q| q.path.as_str()).collect::<Vec<_>>(),
+            ["/api/limits", "/api/secrets?ttl=86400"]
+        );
+        let k = sdrop::format::decode_key(recipient.split('#').nth(1).unwrap()).unwrap();
+        assert_eq!(
+            sdrop::format::decrypt(&reqs[1].body, &k, None).unwrap(),
+            sdrop::format::Secret::Text("hello tui\nline 2".to_string().into())
+        );
+    }
+
+    #[test]
+    fn passphrase_and_ttl_reach_the_link_and_envelope() {
+        let f = serving_with_limit(vec![], 262144);
+        let mut c = client(&f);
+        let mut app = new_app();
+        app.paste("with phrase");
+        focus(&mut app, NewFocus::Ttl);
+        app.key(key(KeyCode::Left));
+        focus(&mut app, NewFocus::UsePass);
+        app.key(key(KeyCode::Char(' ')));
+        focus(&mut app, NewFocus::Pass);
+        app.paste("пароль");
+        focus(&mut app, NewFocus::Create);
+        app.key(key(KeyCode::Enter));
+        app.perform(&mut c);
+        let (recipient, _) = created(&app);
+        assert!(recipient.ends_with("~p"), "{recipient}");
+        let reqs = f.requests();
+        assert_eq!(reqs[1].path, "/api/secrets?ttl=3600");
+        let frag = recipient.split('#').nth(1).unwrap().trim_end_matches("~p");
+        let k = sdrop::format::decode_key(frag).unwrap();
+        assert_eq!(
+            sdrop::format::decrypt(&reqs[1].body, &k, Some("пароль")).unwrap(),
+            sdrop::format::Secret::Text("with phrase".to_string().into())
+        );
+    }
+
+    #[test]
+    fn text_and_files_make_a_bundle() {
+        let f = serving_with_limit(vec![], 262144);
+        let mut c = client(&f);
+        let mut app = new_app();
+        app.paste("note");
+        for (name, data) in [("a.crt", b"CRT".as_slice()), ("b.key", b"KEY".as_slice())] {
+            focus(&mut app, NewFocus::Path);
+            app.paste(&named_file(name, data));
+            app.key(key(KeyCode::Enter));
+        }
+        focus(&mut app, NewFocus::Create);
+        app.key(key(KeyCode::Enter));
+        app.perform(&mut c);
+        let (recipient, _) = created(&app);
+        let reqs = f.requests();
+        assert_eq!(reqs[1].body[4], 2, "bundle in envelope version 2");
+        let k = sdrop::format::decode_key(recipient.split('#').nth(1).unwrap()).unwrap();
+        match sdrop::format::decrypt(&reqs[1].body, &k, None).unwrap() {
+            sdrop::format::Secret::Bundle { text, files } => {
+                assert_eq!(text.as_str(), "note");
+                let got: Vec<_> = files
+                    .iter()
+                    .map(|(n, d)| (n.as_str(), d.to_vec()))
+                    .collect();
+                assert_eq!(
+                    got,
+                    [("a.crt", b"CRT".to_vec()), ("b.key", b"KEY".to_vec())]
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn too_many_files_and_over_limit_send_nothing() {
+        let f = serving_with_limit(vec![], 65536);
+        let mut c = client(&f);
+        let mut app = new_app();
+        for i in 0..21 {
+            focus(&mut app, NewFocus::Path);
+            app.paste(&named_file(&format!("f{i}"), b"x"));
+            app.key(key(KeyCode::Enter));
+        }
+        let Screen::New(form) = &app.screen else {
+            panic!()
+        };
+        assert_eq!(form.files.len(), 20);
+        assert!(app.message.as_ref().unwrap().1.contains("at most 20"));
+        // Over the service limit: only the limit is asked, nothing is created.
+        let mut app = new_app();
+        focus(&mut app, NewFocus::Path);
+        app.paste(&named_file("big.bin", &vec![7u8; 100_000]));
+        app.key(key(KeyCode::Enter));
+        focus(&mut app, NewFocus::Create);
+        app.key(key(KeyCode::Enter));
+        app.perform(&mut c);
+        assert!(matches!(app.screen, Screen::New(_)));
+        assert!(
+            app.message.as_ref().unwrap().1.contains("limit of 64 KB"),
+            "{:?}",
+            app.message
+        );
+        assert_eq!(
+            f.requests()
+                .iter()
+                .map(|q| q.path.as_str())
+                .collect::<Vec<_>>(),
+            ["/api/limits"]
+        );
+    }
+}

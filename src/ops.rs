@@ -82,13 +82,21 @@ pub fn human_size(n: usize) -> String {
 impl Client {
     /// The configured origin (SDROP_ORIGIN or the built-in one). No credentials are read yet.
     pub fn new(interactive_login: bool) -> Result<Client, CliError> {
-        Ok(Client {
-            origin: Origin::configured()?,
+        Ok(Client::with_origin(
+            Origin::configured()?,
+            interactive_login,
+        ))
+    }
+
+    /// A given trusted origin (tests drive the TUI against a local server with it).
+    pub fn with_origin(origin: Origin, interactive_login: bool) -> Client {
+        Client {
+            origin,
             agent: api::agent(),
             creds: None,
             creds_read: false,
             interactive_login,
-        })
+        }
     }
 
     /// Recipient link parsed against the trusted origin, before any request.
