@@ -1,9 +1,9 @@
 //! put / get / status / revoke subcommands (README).
 
-use crate::access;
-use crate::api::{self, CliError, Origin, err, http_error};
+use crate::api::{self, CliError, Origin, err};
 use crate::format::{self, FormatError, Secret};
-use serde_json::Value;
+use crate::ops::{Client, Revoked, Status, human_size};
+use crate::save;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
@@ -140,17 +140,6 @@ fn tty_line(label: &str) -> std::io::Result<String> {
         .ok_or_else(|| std::io::Error::other("no more tty input"))
 }
 
-fn json(body: &[u8]) -> Result<Value, CliError> {
-    serde_json::from_slice(body)
-        .map_err(|_| CliError::Msg("the server returned an unexpected answer".into()))
-}
-
-fn field<'a>(v: &'a Value, name: &str) -> Result<&'a str, CliError> {
-    v.get(name)
-        .and_then(Value::as_str)
-        .ok_or_else(|| CliError::Msg("the server returned an unexpected answer".into()))
-}
-
 pub struct PutArgs<'a> {
     pub ttl: &'a str,
     pub passphrase: bool,
@@ -178,40 +167,10 @@ fn read_file_secret(p: &Path) -> Result<(String, Zeroizing<Vec<u8>>), CliError> 
     Ok((format::sanitize_file_name(&raw), buf))
 }
 
-/// Service limit (`GET /api/limits`): one of the format buckets.
-fn fetch_limit(
-    agent: &ureq::Agent,
-    origin: &Origin,
-    creds: &mut Option<access::Credentials>,
-) -> Result<usize, CliError> {
-    let r = api::call_user(agent, origin, "GET", "/api/limits", creds, &[], None)?;
-    if r.status != 200 {
-        return Err(http_error("reading the service limit failed", r.status));
-    }
-    let v = json(&r.body)?;
-    match v
-        .get("maxBucket")
-        .and_then(Value::as_u64)
-        .map(|n| n as usize)
-    {
-        Some(n) if format::BUCKETS.contains(&n) => Ok(n),
-        _ => err("the server returned an unexpected answer"),
-    }
-}
-
-fn human_size(n: usize) -> String {
-    if n >= 1 << 20 {
-        format!("{} MB", n >> 20)
-    } else if n >= 1024 {
-        format!("{} KB", n >> 10)
-    } else {
-        format!("{n} B")
-    }
-}
-
 /// Recipient and sender links (stdout and stderr are handled in main).
 pub fn put(a: PutArgs) -> Result<(String, String, String), CliError> {
-    let origin = Origin::configured()?;
+    // The origin is checked first, before reading any input (as before the move to ops).
+    Origin::configured()?;
     let ttl = ttl_seconds(a.ttl)?;
     if a.files.len() > format::MAX_FILES {
         return Err(FormatError::TooManyFiles.into());
@@ -244,57 +203,12 @@ pub fn put(a: PutArgs) -> Result<(String, String, String), CliError> {
         }
         (None, false) => None,
     };
-    let mut creds = access::user_preset()?;
-    let agent = api::agent();
-    let limit = fetch_limit(&agent, &origin, &mut creds)?;
-    let (envelope, k_url) =
-        match format::encrypt(&content, passphrase.as_deref().map(String::as_str), limit) {
-            Err(FormatError::TooLarge) => {
-                return err(format!(
-                    "the secret is larger than the service limit of {}",
-                    human_size(limit)
-                ));
-            }
-            r => r?,
-        };
-    let r = api::call_user(
-        &agent,
-        &origin,
-        "POST",
-        &format!("/api/secrets?ttl={ttl}"),
-        &mut creds,
-        &[("Content-Type", "application/octet-stream")],
-        Some(&envelope),
-    )?;
-    if r.status == 413 {
-        return err("the secret is larger than the service limit");
-    }
-    if r.status != 201 {
-        return Err(http_error("creating the secret failed", r.status));
-    }
-    let v = json(&r.body)?;
-    let id = field(&v, "id")?;
-    let token = field(&v, "ownerToken")?;
-    let expires = field(&v, "expiresAt")?;
-    if id.len() != 64
-        || !id.bytes().all(|b| b.is_ascii_hexdigit())
-        || format::decode_key(token).is_err()
-    {
-        return err("the server returned an unexpected answer");
-    }
-    let suffix = if passphrase.is_some() {
-        format::PASSPHRASE_SUFFIX
-    } else {
-        ""
-    };
+    let mut client = Client::new()?;
+    let created = client.create(&content, passphrase.as_deref().map(String::as_str), ttl)?;
     Ok((
-        format!(
-            "{}/s/{id}#{}{suffix}",
-            origin.as_str(),
-            format::encode_base64url(&*k_url)
-        ),
-        format!("{}/o/{id}#{token}", origin.as_str()),
-        api::printable(expires),
+        created.recipient.to_string(),
+        created.owner.to_string(),
+        created.expires,
     ))
 }
 
@@ -310,10 +224,10 @@ pub fn link_arg(url: &str) -> Result<Zeroizing<String>, CliError> {
 /// Secret text. Passphrase: from a file, always before the request; from the terminal, before the
 /// request on `~p`, after it on the envelope flag. Wrong passphrase retry: terminal only (up to 3).
 pub fn get(url: &str, passphrase_file: Option<&Path>, out: Option<&Path>) -> Result<(), CliError> {
-    let origin = Origin::configured()?;
-    let link = api::parse_recipient_link(&origin, url)?;
+    let mut client = Client::new()?;
+    let link = client.recipient_link(url)?;
     if let Some(p) = out.filter(|p| *p != Path::new("-")) {
-        check_target(p)?;
+        save::check_target(p)?;
     }
     let from_file = passphrase_file.map(read_passphrase_file).transpose()?;
     let interactive = from_file.is_none();
@@ -322,34 +236,7 @@ pub fn get(url: &str, passphrase_file: Option<&Path>, out: Option<&Path>) -> Res
         (None, true) => Some(prompt("Passphrase: ")?),
         (None, false) => None,
     };
-    let mut creds = access::user_preset()?;
-    let r = api::call_user(
-        &api::agent(),
-        &origin,
-        "POST",
-        &format!("/api/secrets/{}/consume", link.id),
-        &mut creds,
-        &[],
-        None,
-    )
-    .map_err(|e| match e {
-        // Network dropped: consume may already have happened (FORMAT.md 6: at most one delivery).
-        CliError::Network(m) => CliError::Msg(format!(
-            "{m}. The result is unknown: the secret may already be destroyed on the server. \
-             Try again; if it is then not found, ask the sender to send it again."
-        )),
-        other => other,
-    })?;
-    match r.status {
-        200 => {}
-        404 => {
-            return err(
-                "secret not found, already read, revoked or expired. If you didn't open it yourself, tell the sender.",
-            );
-        }
-        s => return Err(http_error("fetching the secret failed", s)),
-    }
-    let envelope = Zeroizing::new(r.body);
+    let envelope = client.consume(&link)?;
     let mut wrong = 0;
     loop {
         match format::decrypt(
@@ -392,102 +279,6 @@ fn prompt_after_burn() -> Result<Zeroizing<String>, CliError> {
     }
 }
 
-/// `-o` path before consume: the parent is an existing directory, the path itself does not exist.
-fn check_target(p: &Path) -> Result<(), CliError> {
-    let shown = api::printable(&p.display().to_string());
-    let parent = match p.parent() {
-        Some(d) if !d.as_os_str().is_empty() => d,
-        _ => Path::new("."),
-    };
-    if !parent.is_dir() {
-        return err(format!("{shown}: the directory does not exist"));
-    }
-    if std::fs::symlink_metadata(p).is_ok() {
-        return err(format!("{shown} already exists; choose another path"));
-    }
-    Ok(())
-}
-
-/// New file with mode 0600; a partially written one is removed.
-fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
-    let mut f = opts.open(path)?;
-    if let Err(e) = f.write_all(bytes).and_then(|_| f.sync_all()) {
-        drop(f);
-        let _ = std::fs::remove_file(path);
-        return Err(e);
-    }
-    Ok(())
-}
-
-/// Directory builder with mode 0700 on Unix; on Windows the directory inherits the parent's ACL.
-fn private_dir_builder() -> std::fs::DirBuilder {
-    #[allow(unused_mut)]
-    let mut builder = std::fs::DirBuilder::new();
-    #[cfg(unix)]
-    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-    builder
-}
-
-/// New private directory `sdrop-<id8>[-N]` (0700) and a `data` file in it.
-fn save_default(id: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
-    let builder = private_dir_builder();
-    for n in 0..100 {
-        let dir = if n == 0 {
-            PathBuf::from(format!("sdrop-{}", &id[..8]))
-        } else {
-            PathBuf::from(format!("sdrop-{}-{n}", &id[..8]))
-        };
-        match builder.create(&dir) {
-            Ok(()) => {
-                let file = dir.join("data");
-                write_new(&file, bytes)?;
-                return Ok(file);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
-}
-
-/// New private directory (0700) with the given files (0600). On any error everything written is
-/// removed, so a retry starts clean.
-fn write_dir(dir: &Path, entries: &[(String, &[u8])]) -> std::io::Result<()> {
-    let builder = private_dir_builder();
-    builder.create(dir)?;
-    for (i, (name, bytes)) in entries.iter().enumerate() {
-        if let Err(e) = write_new(&dir.join(name), bytes) {
-            for (done, _) in &entries[..i] {
-                let _ = std::fs::remove_file(dir.join(done));
-            }
-            let _ = std::fs::remove_dir(dir);
-            return Err(e);
-        }
-    }
-    Ok(())
-}
-
-/// New private directory `sdrop-<id8>[-N]` with the given files.
-fn save_dir_default(id: &str, entries: &[(String, &[u8])]) -> std::io::Result<PathBuf> {
-    for n in 0..100 {
-        let dir = if n == 0 {
-            PathBuf::from(format!("sdrop-{}", &id[..8]))
-        } else {
-            PathBuf::from(format!("sdrop-{}-{n}", &id[..8]))
-        };
-        match write_dir(&dir, entries) {
-            Ok(()) => return Ok(dir),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
-}
-
 /// Text and files (README, FORMAT.md 4). Without `-o` or with `-o -`: the text to stdout, the files
 /// to a new private directory as `file-N` (sender names are only shown). With `-o PATH`: a new
 /// private directory PATH with `text` and `file-N`. A write error after consume keeps the secret:
@@ -526,13 +317,13 @@ fn deliver_bundle(
         let (shown, result) = match &dest {
             Some(p) => (
                 api::printable(&p.display().to_string()),
-                write_dir(p, &entries).map(|_| p.clone()),
+                save::write_dir(p, &entries).map(|_| p.clone()),
             ),
             None => {
                 tried_default = true;
                 (
                     "the default directory".to_string(),
-                    save_dir_default(id, &entries),
+                    save::save_dir_default(id, &entries),
                 )
             }
         };
@@ -610,11 +401,14 @@ fn deliver(secret: Secret, out: Option<&Path>, id: &str) -> Result<(), CliError>
             }
             Dest::Path(p) => (
                 api::printable(&p.display().to_string()),
-                write_new(p, bytes).map(|_| p.clone()),
+                save::write_new(p, bytes).map(|_| p.clone()),
             ),
             Dest::Default => {
                 tried_default = true;
-                ("the default directory".to_string(), save_default(id, bytes))
+                (
+                    "the default directory".to_string(),
+                    save::save_default(id, bytes),
+                )
             }
         };
         match result {
@@ -644,70 +438,35 @@ fn deliver(secret: Secret, out: Option<&Path>, id: &str) -> Result<(), CliError>
     }
 }
 
-fn status_text(v: &Value) -> Result<String, CliError> {
+fn status_text(s: &Status) -> String {
     let mut out = format!(
         "state:   {}\ncreated: {}\nexpires: {}\n",
-        api::printable(field(v, "state")?),
-        api::printable(field(v, "createdAt")?),
-        api::printable(field(v, "expiresAt")?)
+        s.state, s.created, s.expires
     );
-    if let Some(at) = v.get("consumedAt").and_then(Value::as_str) {
+    if let Some(at) = &s.consumed_at {
         // In public mode there is no name: time only.
-        match v.get("consumedBy").and_then(Value::as_str) {
-            Some(by) => out.push_str(&format!(
-                "read:    {} by {}\n",
-                api::printable(at),
-                api::printable(by)
-            )),
-            None => out.push_str(&format!("read:    {}\n", api::printable(at))),
+        match &s.consumed_by {
+            Some(by) => out.push_str(&format!("read:    {at} by {by}\n")),
+            None => out.push_str(&format!("read:    {at}\n")),
         }
     }
-    Ok(out)
+    out
 }
 
 pub fn status(url: &str) -> Result<String, CliError> {
-    let origin = Origin::configured()?;
-    let link = api::parse_owner_link(&origin, url)?;
-    let mut creds = access::user_preset()?;
-    let auth = Zeroizing::new(format!("Bearer {}", link.token.as_str()));
-    let r = api::call_user(
-        &api::agent(),
-        &origin,
-        "GET",
-        &format!("/api/secrets/{}/status", link.id),
-        &mut creds,
-        &[("Authorization", &auth)],
-        None,
-    )?;
-    match r.status {
-        200 => status_text(&json(&r.body)?),
-        404 => err("secret not found or expired"),
-        s => Err(http_error("fetching the status failed", s)),
-    }
+    let mut client = Client::new()?;
+    let link = client.owner_link(url)?;
+    Ok(status_text(&client.status(&link)?))
 }
 
 pub fn revoke(url: &str) -> Result<String, CliError> {
-    let origin = Origin::configured()?;
-    let link = api::parse_owner_link(&origin, url)?;
-    let mut creds = access::user_preset()?;
-    let auth = Zeroizing::new(format!("Bearer {}", link.token.as_str()));
-    let r = api::call_user(
-        &api::agent(),
-        &origin,
-        "DELETE",
-        &format!("/api/secrets/{}", link.id),
-        &mut creds,
-        &[("Authorization", &auth)],
-        None,
-    )?;
-    match r.status {
-        204 => Ok("revoked\n".into()),
-        409 => err(format!(
-            "already read, cannot revoke:\n{}",
-            status_text(&json(&r.body)?)?
-        )),
-        404 => err("secret not found or expired"),
-        s => Err(http_error("revoking failed", s)),
+    let mut client = Client::new()?;
+    let link = client.owner_link(url)?;
+    match client.revoke(&link)? {
+        Revoked::Done => Ok("revoked\n".into()),
+        Revoked::AlreadyRead(s) => {
+            err(format!("already read, cannot revoke:\n{}", status_text(&s)))
+        }
     }
 }
 
