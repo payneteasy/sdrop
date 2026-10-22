@@ -19,10 +19,48 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
-pub const ACCENT: Color = Color::Rgb(52, 139, 255);
-pub const MUTED: Color = Color::Rgb(105, 116, 122);
-pub const DANGER: Color = Color::Rgb(236, 73, 61);
-pub const OK: Color = Color::Rgb(0, 164, 117);
+/// Brand colors: exact RGB where the terminal supports 24-bit color, else the nearest of the
+/// 256-color palette every terminal has (Apple Terminal draws RGB colors as the default gray).
+pub fn truecolor() -> bool {
+    static TRUECOLOR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRUECOLOR.get_or_init(|| {
+        let colorterm = std::env::var("COLORTERM").unwrap_or_default();
+        let apple = std::env::var("TERM_PROGRAM").is_ok_and(|t| t == "Apple_Terminal");
+        !apple && (colorterm == "truecolor" || colorterm == "24bit")
+    })
+}
+
+fn pick(rgb: (u8, u8, u8), indexed: u8) -> Color {
+    pick_for(truecolor(), rgb, indexed)
+}
+
+fn pick_for(truecolor: bool, rgb: (u8, u8, u8), indexed: u8) -> Color {
+    if truecolor {
+        Color::Rgb(rgb.0, rgb.1, rgb.2)
+    } else {
+        Color::Indexed(indexed)
+    }
+}
+
+/// Dodger Blue #348BFF; 256 colors: 33 (#0087ff).
+pub fn accent() -> Color {
+    pick((52, 139, 255), 33)
+}
+
+/// Nevada #69747A; 256 colors: 244 (#808080).
+pub fn muted() -> Color {
+    pick((105, 116, 122), 244)
+}
+
+/// Danger #EC493D; 256 colors: 203 (#ff5f5f).
+pub fn danger() -> Color {
+    pick((236, 73, 61), 203)
+}
+
+/// Success #00A475; 256 colors: 36 (#00af87).
+pub fn ok() -> Color {
+    pick((0, 164, 117), 36)
+}
 
 pub const HOME_ITEMS: [&str; 4] = ["New secret", "Open a link", "Check status", "Quit"];
 pub const TTLS: [(&str, u32); 3] = [("1 hour", 3600), ("24 hours", 86400), ("7 days", 604800)];
@@ -259,10 +297,12 @@ fn render_buttons(f: &mut Frame, area: Rect, buttons: &[(String, Hit, bool)], hi
         let style = if *primary {
             Style::default()
                 .fg(Color::White)
-                .bg(ACCENT)
+                .bg(accent())
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(ACCENT).add_modifier(Modifier::REVERSED)
+            Style::default()
+                .fg(accent())
+                .add_modifier(Modifier::REVERSED)
         };
         f.render_widget(Paragraph::new(text).style(style), r);
         hits.push((r, *hit));
@@ -939,7 +979,7 @@ impl App {
                         .fg(Color::White)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled("Secrets", Style::default().fg(MUTED)),
+                Span::styled("Secrets", Style::default().fg(muted())),
             ])),
             title,
         );
@@ -998,7 +1038,7 @@ impl App {
         };
         render_buttons(f, bar, &buttons, &mut hits);
         if let Some((is_error, m)) = &self.message {
-            let style = Style::default().fg(if *is_error { DANGER } else { MUTED });
+            let style = Style::default().fg(if *is_error { danger() } else { muted() });
             f.render_widget(
                 Paragraph::new(m.as_str())
                     .style(style)
@@ -1007,7 +1047,7 @@ impl App {
             );
         }
         f.render_widget(
-            Paragraph::new(hints).style(Style::default().fg(MUTED)),
+            Paragraph::new(hints).style(Style::default().fg(muted())),
             footer,
         );
         *self.hits.borrow_mut() = hits;
@@ -1212,7 +1252,7 @@ fn create(f: &mut NewForm, client: &mut Client) -> Result<CreatedView, CliError>
 fn focused_block(title: &str, focused: bool) -> Block<'_> {
     let b = Block::default().borders(Borders::ALL).title(title);
     if focused {
-        b.border_style(Style::default().fg(ACCENT))
+        b.border_style(Style::default().fg(accent()))
     } else {
         b
     }
@@ -1240,7 +1280,7 @@ fn render_home(f: &mut Frame, area: Rect, selected: usize, hits: &mut Hits) {
                 .borders(Borders::ALL)
                 .title(" One-time secrets, encrypted on this machine "),
         )
-        .highlight_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
+        .highlight_style(Style::default().fg(accent()).add_modifier(Modifier::BOLD))
         .highlight_symbol("› ");
     let mut state = ListState::default().with_selected(Some(selected));
     f.render_stateful_widget(list, area, &mut state);
@@ -1396,9 +1436,9 @@ fn render_new(f: &mut Frame, area: Rect, form: &NewForm, hits: &mut Hits) {
     let mut x = ttl.x + prefix.len() as u16;
     for (i, (label, _)) in TTLS.iter().enumerate() {
         let style = if i == form.ttl {
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+            Style::default().fg(accent()).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(MUTED)
+            Style::default().fg(muted())
         };
         let item = format!(" {label} ");
         let w = item.len() as u16;
@@ -1415,12 +1455,12 @@ fn render_new(f: &mut Frame, area: Rect, form: &NewForm, hits: &mut Hits) {
         spans.push(Span::styled(item, style));
     }
     if form.focus == NewFocus::Ttl {
-        spans.push(Span::styled("  ←/→", Style::default().fg(ACCENT)));
+        spans.push(Span::styled("  ←/→", Style::default().fg(accent())));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), ttl);
     let mark = if form.use_pass { "[x]" } else { "[ ]" };
     let style = if form.focus == NewFocus::UsePass {
-        Style::default().fg(ACCENT)
+        Style::default().fg(accent())
     } else {
         Style::default()
     };
@@ -1451,8 +1491,11 @@ fn render_new(f: &mut Frame, area: Rect, form: &NewForm, hits: &mut Hits) {
             ..button
         };
         f.render_widget(
-            Paragraph::new(label)
-                .style(Style::default().fg(ACCENT).add_modifier(Modifier::REVERSED)),
+            Paragraph::new(label).style(
+                Style::default()
+                    .fg(accent())
+                    .add_modifier(Modifier::REVERSED),
+            ),
             button,
         );
         hits.push((button, Hit::Key(ctrl('g'))));
@@ -1464,7 +1507,7 @@ fn render_link_form(f: &mut Frame, area: Rect, i: &Input, title: &str) {
     let [field, hint] = Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).areas(area);
     render_input(f, field, i, title, true);
     f.render_widget(
-        Paragraph::new("Nothing is sent until you confirm.").style(Style::default().fg(MUTED)),
+        Paragraph::new("Nothing is sent until you confirm.").style(Style::default().fg(muted())),
         hint,
     );
 }
@@ -1487,7 +1530,7 @@ fn render_reveal(f: &mut Frame, area: Rect, v: &RevealView) {
             ),
             Line::styled(
                 "Not expecting it? Don't open it, tell the sender.",
-                Style::default().fg(MUTED),
+                Style::default().fg(muted()),
             ),
         ])
         .wrap(Wrap { trim: true }),
@@ -1594,13 +1637,13 @@ fn render_status(f: &mut Frame, area: Rect, v: &StatusView) {
     };
     let row = |k: &'static str, val: String| {
         Line::from(vec![
-            Span::styled(k, Style::default().fg(MUTED)),
+            Span::styled(k, Style::default().fg(muted())),
             Span::raw(val),
         ])
     };
     let mut lines = vec![
         Line::from(vec![
-            Span::styled("State             ", Style::default().fg(MUTED)),
+            Span::styled("State             ", Style::default().fg(muted())),
             Span::styled(state, Style::default().add_modifier(Modifier::BOLD)),
         ]),
         row("Created           ", s.created.clone()),
@@ -1632,16 +1675,16 @@ fn render_created(f: &mut Frame, area: Rect, v: &CreatedView) {
         ),
         Line::styled(
             "It opens once, then the secret is destroyed. Anyone who opens it first can read it.",
-            Style::default().fg(MUTED),
+            Style::default().fg(muted()),
         ),
         Line::raw(""),
-        Line::styled(v.recipient.as_str(), Style::default().fg(ACCENT)),
+        Line::styled(v.recipient.as_str(), Style::default().fg(accent())),
         Line::raw(""),
     ];
     if v.passphrase {
         lines.push(Line::styled(
             "Send the passphrase separately, through a different channel.",
-            Style::default().fg(MUTED),
+            Style::default().fg(muted()),
         ));
     }
     lines.push(Line::styled(
@@ -1649,19 +1692,19 @@ fn render_created(f: &mut Frame, area: Rect, v: &CreatedView) {
             "Opens only once. If nobody opens it, it is deleted on {}.",
             v.expires
         ),
-        Style::default().fg(MUTED),
+        Style::default().fg(muted()),
     ));
     lines.push(Line::raw(""));
     if v.show_owner {
         lines.push(Line::styled(
             "Only for you: track or revoke. Do not send this one.",
-            Style::default().fg(OK),
+            Style::default().fg(ok()),
         ));
         lines.push(Line::raw(v.owner.as_str()));
     } else {
         lines.push(Line::styled(
             "Only for you: track or revoke (o to show)",
-            Style::default().fg(MUTED),
+            Style::default().fg(muted()),
         ));
     }
     f.render_widget(
@@ -1730,6 +1773,12 @@ pub mod tests {
         t.draw(|f| app.render(f)).unwrap();
         let buf = t.backend().buffer().clone();
         buf.content.iter().map(|c| c.symbol()).collect()
+    }
+
+    #[test]
+    fn colors_fall_back_to_the_256_palette() {
+        assert_eq!(pick_for(true, (52, 139, 255), 33), Color::Rgb(52, 139, 255));
+        assert_eq!(pick_for(false, (52, 139, 255), 33), Color::Indexed(33));
     }
 
     #[test]
