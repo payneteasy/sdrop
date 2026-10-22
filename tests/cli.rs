@@ -1158,24 +1158,29 @@ fn sdrop_closed_outputs(
     std::fs::write(&tty_file, tty.join("\n") + "\n").unwrap();
     let cwd = dir.join("cwd");
     std::fs::create_dir_all(&cwd).unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_sdrop"))
-        .args(args)
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_sdrop"));
+    cmd.args(args)
         .current_dir(&cwd)
         .env_clear()
         .envs(platform_env())
         .env("SDROP_ORIGIN", origin)
         .env("SDROP_TEST_ACCESS_TOKEN", TEST_TOKEN)
         .env("SDROP_TEST_TTY_INPUT", &tty_file)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    drop(child.stdout.take());
-    if close_stderr {
-        drop(child.stderr.take());
-    }
-    let out = child.wait_with_output().unwrap();
+        .stdin(Stdio::null());
+    // The read ends are closed before the start: every write fails (EPIPE), with no race
+    // against a child that writes before the parent gets to close them.
+    let closed = || -> Stdio {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        writer.into()
+    };
+    cmd.stdout(closed());
+    cmd.stderr(if close_stderr {
+        closed()
+    } else {
+        Stdio::piped()
+    });
+    let out = cmd.spawn().unwrap().wait_with_output().unwrap();
     (
         out.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&out.stderr).into_owned(),
