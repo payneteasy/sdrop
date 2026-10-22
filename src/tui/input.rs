@@ -151,19 +151,18 @@ impl Input {
         self.cursor = (nstart + col).min(nend);
     }
 
-    /// Line and display column of the cursor (terminal cells: wide characters take two, combining
-    /// marks none), for placing the terminal cursor. Computed in place, without copies.
+    /// Line and display column of the cursor, for placing the terminal cursor. The width of the
+    /// line slice before the cursor is measured as a string (terminal cells, as ratatui draws them:
+    /// wide characters two, combining marks none, emoji ZWJ sequences as one), without copies.
     pub fn line_col(&self) -> (usize, usize) {
-        let (mut line, mut col) = (0, 0);
-        for c in self.text.chars().take(self.cursor) {
-            if c == '\n' {
-                line += 1;
-                col = 0;
-            } else {
-                col += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-            }
-        }
-        (line, col)
+        let at = self.byte_at(self.cursor);
+        let before = &self.text[..at];
+        let line = before.matches('\n').count();
+        let start = before.rfind('\n').map_or(0, |i| i + 1);
+        (
+            line,
+            unicode_width::UnicodeWidthStr::width(&before[start..]),
+        )
     }
 }
 
@@ -214,6 +213,11 @@ mod tests {
         i.insert("界a");
         assert_eq!(i.line_col(), (0, 3));
         i.set("e\u{301}x");
+        assert_eq!(i.line_col(), (0, 2));
+        // An emoji ZWJ sequence and a skin tone modifier take two cells each.
+        i.set("👨\u{200d}👩\u{200d}👧\u{200d}👦x");
+        assert_eq!(i.line_col(), (0, 3));
+        i.set("👍🏽");
         assert_eq!(i.line_col(), (0, 2));
         let mut m = Input::new(true);
         m.insert("a\r\nb\rc\n");
