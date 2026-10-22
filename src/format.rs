@@ -130,13 +130,14 @@ pub enum Content<'a> {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Secret {
     Text(Zeroizing<String>),
+    // File names are part of the secret: kept in wiped buffers too.
     File {
-        name: String,
+        name: Zeroizing<String>,
         data: Zeroizing<Vec<u8>>,
     },
     Bundle {
         text: Zeroizing<String>,
-        files: Vec<(String, Zeroizing<Vec<u8>>)>,
+        files: Vec<(Zeroizing<String>, Zeroizing<Vec<u8>>)>,
     },
 }
 
@@ -231,11 +232,16 @@ pub fn encode_plaintext(
             if data.is_empty() {
                 return Err(FormatError::EmptyFile);
             }
-            let lit = serde_json::to_string(name).map_err(|_| FormatError::BadName)?;
-            (
-                Zeroizing::new(format!("{FILE_PREFIX}{lit}{SIZE_KEY}{}}}", data.len())),
-                *data,
-            )
+            let size = data.len().to_string();
+            let mut h = Zeroizing::new(String::with_capacity(
+                FILE_PREFIX.len() + json_string_len(name) + SIZE_KEY.len() + size.len() + 1,
+            ));
+            h.push_str(FILE_PREFIX);
+            push_json_string(&mut h, name);
+            h.push_str(SIZE_KEY);
+            h.push_str(&size);
+            h.push('}');
+            (h, *data)
         }
         Content::Bundle { text, files } => {
             if files.len() > MAX_FILES {
@@ -385,80 +391,95 @@ pub fn plaintext_len(text: &str, files: &[(&str, usize)]) -> usize {
     4 + header + data
 }
 
-/// Canonical bundle header (FORMAT.md 4), in a preallocated wiped buffer.
+const NAME_KEY: &str = r#"{"name":"#;
+
+/// Canonical bundle header (FORMAT.md 4), written straight into a preallocated wiped buffer (no
+/// intermediate copies of the text or the names).
 fn bundle_header(text: &str, files: &[(&str, usize)]) -> Result<Zeroizing<String>, FormatError> {
-    let list: Vec<String> = files
-        .iter()
-        .map(|(name, size)| {
-            let mut e = String::with_capacity(json_string_len(name) + 32);
-            e.push_str(r#"{"name":"#);
-            push_json_string(&mut e, name);
-            e.push_str(&format!(r#","size":{size}}}"#));
-            e
-        })
-        .collect();
-    let cap = BUNDLE_PREFIX.len()
-        + json_string_len(text)
-        + FILES_KEY.len()
-        + list.iter().map(|e| e.len() + 1).sum::<usize>()
-        + 3;
-    let mut out = Zeroizing::new(String::with_capacity(cap));
+    let data: usize = files.iter().map(|(_, z)| z).sum();
+    let mut out = Zeroizing::new(String::with_capacity(plaintext_len(text, files) - 4 - data));
     out.push_str(BUNDLE_PREFIX);
     push_json_string(&mut out, text);
     out.push_str(FILES_KEY);
     out.push('[');
-    out.push_str(&list.join(","));
+    for (i, (name, size)) in files.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(NAME_KEY);
+        push_json_string(&mut out, name);
+        out.push_str(SIZE_KEY);
+        out.push_str(&size.to_string());
+        out.push('}');
+    }
     out.push_str("]}");
     Ok(out)
 }
 
-/// Bundle header: the text and the file names with sizes.
-type BundleHeader = (Zeroizing<String>, Vec<(String, usize)>);
-
-/// Bundle header (FORMAT.md 4). The text literal is decoded by `decode_json_literal` (wiped
-/// buffer, canonical forms only); the file list by serde_json. The header is accepted only if its
-/// canonical rewrite gives the same string.
-fn parse_bundle_header(s: &str) -> Result<BundleHeader, FormatError> {
-    let rest = s.strip_prefix(BUNDLE_PREFIX).ok_or(FormatError::Corrupt)?;
-    // End of the text literal: the first unescaped quote after the opening one.
-    let bytes = rest.as_bytes();
+/// Length of the JSON string literal at the start of `s` (up to and including the closing quote).
+fn literal_len(s: &str) -> Result<usize, FormatError> {
+    let bytes = s.as_bytes();
     if bytes.first() != Some(&b'"') {
         return Err(FormatError::Corrupt);
     }
     let mut i = 1;
-    let close = loop {
+    loop {
         match bytes.get(i) {
             Some(b'\\') => i += 2,
-            Some(b'"') => break i,
+            Some(b'"') => return Ok(i + 1),
             Some(_) => i += 1,
             None => return Err(FormatError::Corrupt),
         }
-    };
-    let text = decode_json_literal(&rest[..=close])?;
-    let list_json = rest[close + 1..]
-        .strip_prefix(FILES_KEY)
-        .and_then(|l| l.strip_suffix('}'))
-        .ok_or(FormatError::Corrupt)?;
-    let v: serde_json::Value = serde_json::from_str(list_json).map_err(|_| FormatError::Corrupt)?;
-    let list = v.as_array().ok_or(FormatError::Corrupt)?;
-    if list.is_empty() || list.len() > MAX_FILES || (list.len() == 1 && text.is_empty()) {
-        return Err(FormatError::Corrupt);
     }
-    let mut files = Vec::with_capacity(list.len());
-    for f in list {
-        let f = f.as_object().ok_or(FormatError::Corrupt)?;
-        let name = f
-            .get("name")
-            .and_then(|n| n.as_str())
-            .filter(|n| valid_file_name(n))
-            .ok_or(FormatError::Corrupt)?;
-        let size = f
-            .get("size")
-            .and_then(|n| n.as_u64())
-            .filter(|n| *n >= 1)
-            .and_then(|n| usize::try_from(n).ok())
-            .ok_or(FormatError::Corrupt)?;
-        files.push((name.to_owned(), size));
+}
+
+/// A file size in canonical form: 1-8 digits without a leading zero, at least 1.
+fn canonical_size(digits: &str) -> Option<usize> {
+    let ok = (1..=8).contains(&digits.len())
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && !digits.starts_with('0');
+    ok.then(|| digits.parse().ok()).flatten()
+}
+
+/// Bundle header: the text and the file names with sizes.
+type BundleHeader = (Zeroizing<String>, Vec<(Zeroizing<String>, usize)>);
+
+/// Bundle header (FORMAT.md 4). The text and the names are decoded by `decode_json_literal` (wiped
+/// buffers, canonical forms only). The header is accepted only if its canonical rewrite gives the
+/// same string.
+fn parse_bundle_header(s: &str) -> Result<BundleHeader, FormatError> {
+    let rest = s.strip_prefix(BUNDLE_PREFIX).ok_or(FormatError::Corrupt)?;
+    let close = literal_len(rest)?;
+    let text = decode_json_literal(&rest[..close])?;
+    let list = rest[close..]
+        .strip_prefix(FILES_KEY)
+        .and_then(|l| l.strip_suffix("]}"))
+        .and_then(|l| l.strip_prefix('['))
+        .ok_or(FormatError::Corrupt)?;
+    // [{"name":"…","size":N},…]: each name decoded into a wiped buffer, no JSON parser copies.
+    let mut files: Vec<(Zeroizing<String>, usize)> = Vec::with_capacity(MAX_FILES);
+    let mut rest = list;
+    loop {
+        let r = rest.strip_prefix(NAME_KEY).ok_or(FormatError::Corrupt)?;
+        let n = literal_len(r)?;
+        let name = decode_json_literal(&r[..n])?;
+        if !valid_file_name(&name) {
+            return Err(FormatError::Corrupt);
+        }
+        let r = r[n..].strip_prefix(SIZE_KEY).ok_or(FormatError::Corrupt)?;
+        let digits = r.find('}').ok_or(FormatError::Corrupt)?;
+        let size = canonical_size(&r[..digits]).ok_or(FormatError::Corrupt)?;
+        files.push((name, size));
+        if files.len() > MAX_FILES {
+            return Err(FormatError::Corrupt);
+        }
+        match &r[digits + 1..] {
+            "" => break,
+            more => rest = more.strip_prefix(',').ok_or(FormatError::Corrupt)?,
+        }
+    }
+    if files.len() == 1 && text.is_empty() {
+        return Err(FormatError::Corrupt);
     }
     let refs: Vec<(&str, usize)> = files.iter().map(|(n, z)| (n.as_str(), *z)).collect();
     if *bundle_header(&text, &refs)? != s {
@@ -511,26 +532,17 @@ pub fn decode_plaintext(plain: &[u8], version: u8) -> Result<Secret, FormatError
     } else if let Some(rest) = body.strip_prefix(FILE_PREFIX) {
         let at = rest.rfind(SIZE_KEY).ok_or(FormatError::Corrupt)?;
         let digits = &rest[at + SIZE_KEY.len()..];
-        let ok_digits = (1..=8).contains(&digits.len())
-            && digits.bytes().all(|b| b.is_ascii_digit())
-            && !digits.starts_with('0');
-        if !ok_digits {
-            return Err(FormatError::Corrupt);
-        }
+        let size = canonical_size(digits).ok_or(FormatError::Corrupt)?;
         let name = canonical_string(&rest[..at])?;
         if !valid_file_name(&name) {
             return Err(FormatError::Corrupt);
         }
-        let size: usize = digits.parse().map_err(|_| FormatError::Corrupt)?;
         if 4 + len + size > plain.len() {
             return Err(FormatError::Corrupt);
         }
         let data = Zeroizing::new(plain[end..end + size].to_vec());
         end += size;
-        Secret::File {
-            name: name.to_string(),
-            data,
-        }
+        Secret::File { name, data }
     } else {
         return Err(FormatError::Corrupt);
     };

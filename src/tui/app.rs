@@ -1162,14 +1162,17 @@ impl App {
                         Screen::Revealed(v) => v.focus = RevealedFocus::Dir,
                         _ => self.set_simple_focus(0),
                     },
-                    Hit::RevealedText => {
+                    // Only what Tab can reach now: while saving, the field and its buttons.
+                    Hit::RevealedText | Hit::RevealedFiles => {
                         if let Screen::Revealed(v) = &mut self.screen {
-                            v.focus = RevealedFocus::Text;
-                        }
-                    }
-                    Hit::RevealedFiles => {
-                        if let Screen::Revealed(v) = &mut self.screen {
-                            v.focus = RevealedFocus::Files;
+                            let to = if hit == Hit::RevealedText {
+                                RevealedFocus::Text
+                            } else {
+                                RevealedFocus::Files
+                            };
+                            if v.order().contains(&to) {
+                                v.focus = to;
+                            }
                         }
                     }
                 }

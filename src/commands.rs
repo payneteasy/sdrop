@@ -285,7 +285,7 @@ fn prompt_after_burn() -> Result<Zeroizing<String>, CliError> {
 /// another terminal path or the default directory, as for a single file.
 fn deliver_bundle(
     text: &str,
-    files: &[(String, Zeroizing<Vec<u8>>)],
+    files: &[(Zeroizing<String>, Zeroizing<Vec<u8>>)],
     out: Option<&Path>,
     id: &str,
 ) -> Result<(), CliError> {

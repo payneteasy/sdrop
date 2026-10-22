@@ -81,15 +81,14 @@ fn same(got: &Secret, want: &Expected) -> bool {
     match (got, want) {
         (Secret::Text(t), Expected::Text(w)) => t.as_str() == w,
         (Secret::File { name, data }, Expected::File(n, d)) => {
-            name == n && data.as_slice() == d.as_slice()
+            name.as_str() == n.as_str() && data.as_slice() == d.as_slice()
         }
         (Secret::Bundle { text, files }, Expected::Bundle(t, w)) => {
             text.as_str() == t
                 && files.len() == w.len()
-                && files
-                    .iter()
-                    .zip(w)
-                    .all(|((n, d), (wn, wd))| n == wn && d.as_slice() == wd.as_slice())
+                && files.iter().zip(w).all(|((n, d), (wn, wd))| {
+                    n.as_str() == wn.as_str() && d.as_slice() == wd.as_slice()
+                })
         }
         _ => false,
     }
@@ -461,5 +460,29 @@ fn plaintext_len_matches_the_encoding() {
             4 + header + data,
             "{text:?}"
         );
+    }
+}
+
+#[test]
+fn bundle_names_that_look_like_the_list_roundtrip() {
+    let names = [
+        r#"a},{"name":"b"#,
+        r#"x","size":1}]}"#,
+        "q\"u\"o\"te",
+        "brace}",
+        "comma,",
+        "ключ 🔐.pem",
+    ];
+    let data = [1u8, 2, 3];
+    let files: Vec<(&str, &[u8])> = names.iter().map(|n| (*n, &data[..])).collect();
+    let plain = format::encode_plaintext(&format::compose("t", files), format::MAX_BUCKET).unwrap();
+    match format::decode_plaintext(&plain, 2).unwrap() {
+        Secret::Bundle { text, files } => {
+            assert_eq!(text.as_str(), "t");
+            let got: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+            assert_eq!(got, names);
+            assert!(files.iter().all(|(_, d)| d.as_slice() == data));
+        }
+        other => panic!("{other:?}"),
     }
 }

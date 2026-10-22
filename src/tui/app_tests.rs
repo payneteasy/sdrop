@@ -113,8 +113,14 @@ fn files_secret() -> Secret {
     Secret::Bundle {
         text: Zeroizing::new("note".into()),
         files: vec![
-            ("a.pem".into(), Zeroizing::new(b"AAA".to_vec())),
-            ("b.pem".into(), Zeroizing::new(b"BBB".to_vec())),
+            (
+                Zeroizing::new("a.pem".into()),
+                Zeroizing::new(b"AAA".to_vec()),
+            ),
+            (
+                Zeroizing::new("b.pem".into()),
+                Zeroizing::new(b"BBB".to_vec()),
+            ),
         ],
     }
 }
@@ -481,7 +487,12 @@ fn long_revealed_line_wraps_and_scrolls_to_the_end() {
 fn many_received_files_scroll() {
     let mut app = App::new(Box::new(MemClip::default()));
     let files = (0..20)
-        .map(|i| (format!("f-{i:02}.bin"), Zeroizing::new(vec![b'x'; 10])))
+        .map(|i| {
+            (
+                Zeroizing::new(format!("f-{i:02}.bin")),
+                Zeroizing::new(vec![b'x'; 10]),
+            )
+        })
         .collect();
     app.reveal(
         "0".repeat(64),
@@ -666,6 +677,45 @@ fn leaving_unsaved_files_asks_and_defaults_to_stay() {
     app.key(key(KeyCode::Left));
     app.key(key(KeyCode::Enter));
     assert!(app.quit);
+}
+
+/// While saving, clicks on the text or the file list do not move the focus out of the Tab order.
+#[test]
+fn clicks_while_saving_keep_the_focus_in_the_tab_order() {
+    let mut app = App::new(Box::new(MemClip::default()));
+    app.reveal("0".repeat(64), files_secret());
+    click(&mut app, Hit::RevealedFiles);
+    let Screen::Revealed(v) = &app.screen else {
+        unreachable!()
+    };
+    assert_eq!(v.focus, RevealedFocus::Files);
+    app.key(key(KeyCode::Char('s')));
+    for hit in [Hit::RevealedText, Hit::RevealedFiles] {
+        click(&mut app, hit);
+        let Screen::Revealed(v) = &app.screen else {
+            unreachable!()
+        };
+        assert!(v.order().contains(&v.focus), "{hit:?}: {:?}", v.focus);
+        assert_eq!(v.focus, RevealedFocus::Dir);
+    }
+}
+
+/// Received names are shown with control characters replaced, in full otherwise.
+#[test]
+fn received_names_are_shown_safely() {
+    let mut app = App::new(Box::new(MemClip::default()));
+    app.reveal(
+        "0".repeat(64),
+        Secret::File {
+            name: Zeroizing::new("evil\u{9b}31mname.txt".into()),
+            data: Zeroizing::new(b"x".to_vec()),
+        },
+    );
+    let s = screen_text(&app);
+    assert!(
+        s.contains("evil?31mname.txt") && !s.contains('\u{9b}'),
+        "{s}"
+    );
 }
 
 #[test]

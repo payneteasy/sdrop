@@ -893,7 +893,7 @@ fn put_file_sends_name_and_bytes_after_limit() {
     let key = sdrop::format::decode_key(link.split('#').nth(1).unwrap()).unwrap();
     match sdrop::format::decrypt(&reqs[1].body, &key, None).unwrap() {
         sdrop::format::Secret::File { name, data } => {
-            assert_eq!(name, "f");
+            assert_eq!(name.as_str(), "f");
             assert_eq!(data.as_slice(), &[0, 1, 2, 255, 0]);
         }
         other => panic!("{other:?}"),
