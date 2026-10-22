@@ -132,6 +132,20 @@ fn split_link<'a>(
         .and_then(|r| r.strip_prefix(kind))
         .and_then(|r| r.strip_prefix('/'));
     let Some(rest) = rest else {
+        // The right service, the other kind of link: say which one is needed.
+        let other = if kind == 's' { 'o' } else { 's' };
+        let same_service = url
+            .strip_prefix(origin.as_str())
+            .and_then(|r| r.strip_prefix('/'))
+            .and_then(|r| r.strip_prefix(other))
+            .is_some_and(|r| r.starts_with('/'));
+        if same_service {
+            return err(if kind == 'o' {
+                "this is the recipient link (/s/…), it opens the secret. Use your status link (/o/…), shown under \"Only for you\" when the secret was created"
+            } else {
+                "this is a status link (/o/…): it shows whether the secret was read and does not open it. Check it with `sdrop status` or Check status"
+            });
+        }
         return err(format!("the link is not for {}", origin.as_str()));
     };
     let (id, fragment) = rest.split_once('#').ok_or(FormatError::BadLink)?;
@@ -335,6 +349,25 @@ mod tests {
         let key = "A".repeat(43);
         let id = "a".repeat(64);
         assert!(parse_recipient_link(&o, &format!("https://s.example.com/s/{id}#{key}")).is_ok());
+        // The other kind of link of the same service: a message saying which one is needed.
+        let e = parse_owner_link(&o, &format!("https://s.example.com/s/{id}#{key}"))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            e.contains("recipient link") && e.contains("status link (/o/"),
+            "{e}"
+        );
+        let e = parse_recipient_link(&o, &format!("https://s.example.com/o/{id}#{key}"))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("this is a status link"), "{e}");
+        let e = parse_owner_link(&o, &format!("https://evil.example.com/s/{id}#{key}"))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("not for https://s.example.com"), "{e}");
         for bad in [
             format!("https://s.example.com.evil.com/s/{id}#{key}"),
             format!("https://s.example.com:443/s/{id}#{key}"),

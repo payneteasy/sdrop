@@ -1874,6 +1874,39 @@ mod tui_open {
     }
 
     #[test]
+    fn wrong_kind_of_link_explains_and_sends_nothing() {
+        let f = never_called();
+        let mut c = client(&f);
+        let key = "A".repeat(43);
+        // A recipient link pasted into Check status: never consumed, the message says what to use.
+        let mut app = App::new(Box::new(MemClip::default()));
+        app.key(key(KeyCode::Down));
+        app.key(key(KeyCode::Down));
+        app.key(key(KeyCode::Enter));
+        app.paste(&format!("{}/s/{ID}#{key}", f.origin));
+        app.key(key(KeyCode::Enter));
+        app.perform(&mut c);
+        assert!(matches!(app.screen, Screen::StatusForm(_)));
+        assert!(
+            app.message.as_ref().unwrap().1.contains("recipient link"),
+            "{:?}",
+            app.message
+        );
+        // A status link pasted into Open a link.
+        let app = opened(
+            &format!("{}/o/{ID}#{key}", f.origin),
+            &mut c,
+            MemClip::default(),
+        );
+        assert!(
+            app.message.as_ref().unwrap().1.contains("status link"),
+            "{:?}",
+            app.message
+        );
+        assert_eq!(f.requests().len(), 0);
+    }
+
+    #[test]
     fn reveal_only_after_confirmation_exactly_one_consume() {
         let v = vector("plain-ascii");
         let f = serving_with_limit(hex(v["envelope_hex"].as_str().unwrap()), 262144);
