@@ -433,3 +433,33 @@ fn decode_plaintext_only_versions_1_and_2() {
         );
     }
 }
+
+#[test]
+fn plaintext_len_matches_the_encoding() {
+    type Files<'a> = Vec<(&'a str, &'a [u8])>;
+    let d1 = vec![7u8; 1234];
+    let d2 = [8u8; 5];
+    let cases: Vec<(&str, Files)> = vec![
+        ("hello \"world\"\n\u{1}", vec![]),
+        ("", vec![("key.pem", &d1[..])]),
+        ("note", vec![("ключ.pem", &d1[..])]),
+        ("", vec![("a", &d1[..]), ("b\"c", &d2[..])]),
+        (
+            "текст 🔐",
+            vec![("a", &d1[..]), ("b", &d2[..]), ("c", &d2[..])],
+        ),
+    ];
+    for (text, files) in cases {
+        let sizes: Vec<(&str, usize)> = files.iter().map(|(n, d)| (*n, d.len())).collect();
+        let plain =
+            format::encode_plaintext(&format::compose(text, files.clone()), format::MAX_BUCKET)
+                .unwrap();
+        let header = u32::from_be_bytes([plain[0], plain[1], plain[2], plain[3]]) as usize;
+        let data: usize = sizes.iter().map(|(_, z)| z).sum();
+        assert_eq!(
+            format::plaintext_len(text, &sizes),
+            4 + header + data,
+            "{text:?}"
+        );
+    }
+}

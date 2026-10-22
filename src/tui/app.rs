@@ -1,66 +1,23 @@
-//! TUI state machine (README, "Interactive mode"): keys and pastes change the state; network and
-//! disk work is queued as an operation and run between frames (`perform`), so tests drive the app
-//! without a terminal (ratatui `TestBackend`) and with a local test server.
+//! TUI state machine (README, "Interactive mode"): keys, clicks and pastes become actions that
+//! change the state; network and disk work is queued as an operation and run between frames
+//! (`perform`), so tests drive the app without a terminal and with a local test server. Drawing is
+//! in `view.rs`.
 
 use super::clipboard::{Clip, Unavailable, Via};
 use super::input::Input;
+use super::theme::Role;
+use super::widgets::Button;
 use crate::api::{CliError, OwnerLink, RecipientLink};
 use crate::format::{self, FormatError, Secret};
-use crate::ops::{Client, Revoked, Status, human_size};
+use crate::ops::{Client, Revoked, Status};
 use crate::save;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::layout::Rect;
 use sha2::{Digest, Sha256};
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
-
-/// Brand colors: exact RGB where the terminal supports 24-bit color, else the nearest of the
-/// 256-color palette every terminal has (Apple Terminal draws RGB colors as the default gray).
-pub fn truecolor() -> bool {
-    static TRUECOLOR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *TRUECOLOR.get_or_init(|| {
-        let colorterm = std::env::var("COLORTERM").unwrap_or_default();
-        let apple = std::env::var("TERM_PROGRAM").is_ok_and(|t| t == "Apple_Terminal");
-        !apple && (colorterm == "truecolor" || colorterm == "24bit")
-    })
-}
-
-fn pick(rgb: (u8, u8, u8), indexed: u8) -> Color {
-    pick_for(truecolor(), rgb, indexed)
-}
-
-fn pick_for(truecolor: bool, rgb: (u8, u8, u8), indexed: u8) -> Color {
-    if truecolor {
-        Color::Rgb(rgb.0, rgb.1, rgb.2)
-    } else {
-        Color::Indexed(indexed)
-    }
-}
-
-/// Dodger Blue #348BFF; 256 colors: 33 (#0087ff).
-pub fn accent() -> Color {
-    pick((52, 139, 255), 33)
-}
-
-/// Nevada #69747A; 256 colors: 244 (#808080).
-pub fn muted() -> Color {
-    pick((105, 116, 122), 244)
-}
-
-/// Danger #EC493D; 256 colors: 203 (#ff5f5f).
-pub fn danger() -> Color {
-    pick((236, 73, 61), 203)
-}
-
-/// Success #00A475; 256 colors: 36 (#00af87).
-pub fn ok() -> Color {
-    pick((0, 164, 117), 36)
-}
 
 pub const HOME_ITEMS: [&str; 4] = ["New secret", "Open a link", "Check status", "Quit"];
 pub const TTLS: [(&str, u32); 3] = [("1 hour", 3600), ("24 hours", 86400), ("7 days", 604800)];
@@ -69,15 +26,54 @@ pub const CLEAR_AFTER: Duration = Duration::from_secs(60);
 /// Retry interval when the clipboard is unavailable at removal time.
 pub const CLEAR_RETRY: Duration = Duration::from_secs(5);
 
+/// Everything a key, a button or a click can do: both paths call the same code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    // Home
+    Open(usize),
+    // New secret
+    AddFile,
+    RemoveFile(usize),
+    SelectFile(usize),
+    GeneratePassphrase,
+    TogglePassphrase,
+    SetTtl(usize),
+    Create,
+    // Link ready
+    CopyRecipient,
+    ToggleOwner,
+    CopyOwner,
+    NewSecret,
+    // Open a link, Check status
+    CheckLink,
+    // Reveal, Unlock
+    Reveal,
+    Decrypt,
+    // Revealed
+    CopyText,
+    StartSave,
+    Save,
+    CancelSave,
+    // Status
+    RefreshStatus,
+    AskRevoke,
+    // Any screen
+    Back,
+    Choose(usize),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NewFocus {
     Text,
     Path,
+    Add,
     Files,
     Ttl,
     UsePass,
     Pass,
+    Generate,
     Create,
+    Back,
 }
 
 pub struct PickedFile {
@@ -91,6 +87,8 @@ pub struct NewForm {
     pub path: Input,
     pub files: Vec<PickedFile>,
     pub file_sel: usize,
+    /// First file row drawn (kept by the view so the selected file stays visible).
+    pub file_top: Cell<usize>,
     pub ttl: usize,
     pub use_pass: bool,
     pub pass: Input,
@@ -105,6 +103,7 @@ impl NewForm {
             path: Input::new(false),
             files: Vec::new(),
             file_sel: 0,
+            file_top: Cell::new(0),
             ttl: 1,
             use_pass: false,
             pass: Input::new(false),
@@ -113,16 +112,17 @@ impl NewForm {
         }
     }
 
-    fn order(&self) -> Vec<NewFocus> {
-        let mut v = vec![NewFocus::Text, NewFocus::Path];
+    /// Tab order: fields and buttons as they appear; hidden ones are skipped.
+    pub fn order(&self) -> Vec<NewFocus> {
+        let mut v = vec![NewFocus::Text, NewFocus::Path, NewFocus::Add];
         if !self.files.is_empty() {
             v.push(NewFocus::Files);
         }
         v.extend([NewFocus::Ttl, NewFocus::UsePass]);
         if self.use_pass {
-            v.push(NewFocus::Pass);
+            v.extend([NewFocus::Pass, NewFocus::Generate]);
         }
-        v.push(NewFocus::Create);
+        v.extend([NewFocus::Create, NewFocus::Back]);
         v
     }
 
@@ -140,12 +140,20 @@ pub struct CreatedView {
     pub expires: String,
     pub passphrase: bool,
     pub show_owner: bool,
+    pub focus: usize,
+}
+
+/// A link field of Open a link / Check status; focus 0 is the field.
+pub struct LinkForm {
+    pub input: Input,
+    pub focus: usize,
 }
 
 /// A link was checked (no request yet): reveal on confirmation.
 pub struct RevealView {
     pub link: RecipientLink,
     pub pass: Input,
+    pub focus: usize,
 }
 
 /// The envelope is fetched (the server has deleted it) and needs a passphrase: it is kept only
@@ -154,6 +162,15 @@ pub struct UnlockView {
     pub link: RecipientLink,
     pub envelope: Zeroizing<Vec<u8>>,
     pub pass: Input,
+    pub focus: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevealedFocus {
+    Text,
+    Files,
+    Dir,
+    Button(usize),
 }
 
 pub struct RevealedView {
@@ -161,11 +178,14 @@ pub struct RevealedView {
     pub secret: Secret,
     pub scroll: usize,
     /// Last page start as of the last frame, so that keys stop scrolling at the end.
-    pub max_scroll: std::cell::Cell<usize>,
+    pub max_scroll: Cell<usize>,
+    pub file_top: usize,
+    pub max_file_top: Cell<usize>,
     /// Typing the directory to save into.
     pub saving: bool,
     pub dir: Input,
     pub saved: Option<String>,
+    pub focus: RevealedFocus,
 }
 
 impl RevealedView {
@@ -178,7 +198,7 @@ impl RevealedView {
     }
 
     /// Sender file names and sizes (names are only shown, never used as paths).
-    fn files(&self) -> Vec<(&str, usize)> {
+    pub fn files(&self) -> Vec<(&str, usize)> {
         match &self.secret {
             Secret::Text(_) => vec![],
             Secret::File { name, data } => vec![(name.as_str(), data.len())],
@@ -207,26 +227,43 @@ impl RevealedView {
         v
     }
 
-    fn has_files(&self) -> bool {
+    pub fn has_files(&self) -> bool {
         !matches!(self.secret, Secret::Text(_))
+    }
+
+    /// Focus order: the text and the file list (when there), the save field, the buttons.
+    pub fn order(&self) -> Vec<RevealedFocus> {
+        let mut v = Vec::new();
+        if self.saving {
+            v.push(RevealedFocus::Dir);
+        } else {
+            if !self.text().is_empty() {
+                v.push(RevealedFocus::Text);
+            }
+            if self.has_files() {
+                v.push(RevealedFocus::Files);
+            }
+        }
+        v.extend((0..revealed_buttons(self).len()).map(RevealedFocus::Button));
+        v
     }
 }
 
 pub struct StatusView {
     pub link: OwnerLink,
     pub status: Status,
-    pub confirm_revoke: bool,
+    pub focus: usize,
 }
 
 pub enum Screen {
     Home { selected: usize },
     New(Box<NewForm>),
     Created(CreatedView),
-    Open(Input),
+    Open(LinkForm),
     Reveal(Box<RevealView>),
     Unlock(Box<UnlockView>),
     Revealed(Box<RevealedView>),
-    StatusForm(Input),
+    StatusForm(LinkForm),
     Status(Box<StatusView>),
 }
 
@@ -241,7 +278,77 @@ impl Screen {
     }
 }
 
-/// Work queued by a key and run between frames.
+/// Where a confirmed leave goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Intent {
+    Home,
+    Quit,
+}
+
+/// A confirmation over the screen; the background takes no clicks meanwhile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialogKind {
+    /// Leaving the received files unsaved.
+    LeaveUnsaved(Intent),
+    /// Leaving the passphrase screen: the fetched envelope is dropped.
+    Discard(Intent),
+    Revoke,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Dialog {
+    pub kind: DialogKind,
+    /// Starts on the safe choice (index 0).
+    pub focus: usize,
+}
+
+impl Dialog {
+    pub fn title(&self) -> &'static str {
+        match self.kind {
+            DialogKind::LeaveUnsaved(_) => "Leave without saving?",
+            DialogKind::Discard(_) => "Discard the downloaded secret?",
+            DialogKind::Revoke => "Revoke this secret?",
+        }
+    }
+
+    pub fn lines(&self, files: usize) -> Vec<String> {
+        match self.kind {
+            DialogKind::LeaveUnsaved(_) => vec![
+                format!(
+                    "{files} received file{} not saved.",
+                    if files == 1 { " is" } else { "s are" }
+                ),
+                "The server copy is already deleted.".into(),
+            ],
+            DialogKind::Discard(_) => vec![
+                "The server copy is already deleted.".into(),
+                "You cannot download it again.".into(),
+            ],
+            DialogKind::Revoke => vec!["The recipient link will stop working.".into()],
+        }
+    }
+
+    /// The choices; the first one is safe.
+    pub fn buttons(&self) -> Vec<Button<Action>> {
+        let b = |l: &str, i: usize, role: Role| Button::new(l, "", Action::Choose(i), role);
+        match self.kind {
+            DialogKind::LeaveUnsaved(_) => vec![
+                b("Stay", 0, Role::Primary),
+                b("Save files", 1, Role::Secondary),
+                b("Leave without saving", 2, Role::Danger),
+            ],
+            DialogKind::Discard(_) => vec![
+                b("Keep trying", 0, Role::Primary),
+                b("Discard", 1, Role::Danger),
+            ],
+            DialogKind::Revoke => {
+                vec![b("Cancel", 0, Role::Primary), b("Revoke", 1, Role::Danger)]
+            }
+        }
+    }
+}
+
+/// Work queued by an action and run between frames.
 pub enum Op {
     Create,
     OpenLink,
@@ -253,62 +360,20 @@ pub enum Op {
     Revoke,
 }
 
-/// What a mouse click hits; recorded while drawing. A button is the same as pressing its key.
+/// What a mouse click hits; recorded while drawing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hit {
-    Key(KeyEvent),
+    /// A button or a clickable line: the action (and the focus moves to it).
+    Act(Action, Option<usize>),
     Home(usize),
     Focus(NewFocus),
-    Ttl(usize),
-    PassToggle,
-    File(usize),
+    /// The text field of a link, passphrase or directory screen.
+    Field,
+    RevealedText,
+    RevealedFiles,
 }
 
-type Hits = Vec<(Rect, Hit)>;
-
-fn press(c: KeyCode) -> KeyEvent {
-    KeyEvent::new(c, KeyModifiers::NONE)
-}
-
-fn ctrl(c: char) -> KeyEvent {
-    KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
-}
-
-/// Buttons in rows: a button that does not fit moves to the next row (never cut). The first may
-/// be primary (filled). Each records its click area.
-fn render_buttons(f: &mut Frame, area: Rect, buttons: &[(String, Hit, bool)], hits: &mut Hits) {
-    let (mut x, mut y) = (area.x, area.y);
-    for (label, hit, primary) in buttons {
-        let text = format!(" {label} ");
-        let w = unicode_width::UnicodeWidthStr::width(text.as_str()) as u16;
-        if x > area.x && x + w > area.right() {
-            x = area.x;
-            y += 1;
-        }
-        if y >= area.bottom() {
-            break;
-        }
-        let r = Rect {
-            x,
-            y,
-            width: w.min(area.right().saturating_sub(x)),
-            height: 1,
-        };
-        let style = if *primary {
-            Style::default()
-                .fg(Color::White)
-                .bg(accent())
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-                .fg(accent())
-                .add_modifier(Modifier::REVERSED)
-        };
-        f.render_widget(Paragraph::new(text).style(style), r);
-        hits.push((r, *hit));
-        x = x.saturating_add(w + 2);
-    }
-}
+pub type Hits = Vec<(Rect, Hit)>;
 
 /// A copied secret text to remove from the clipboard later: when, and a hash to recognise it.
 struct PendingClear {
@@ -318,14 +383,19 @@ struct PendingClear {
 
 pub struct App {
     pub screen: Screen,
+    pub dialog: Option<Dialog>,
     pub quit: bool,
-    /// A secret would be destroyed by leaving: the next leave key confirms.
-    leave_armed: bool,
     /// Error (true) or note shown above the footer until the next key.
     pub message: Option<(bool, String)>,
     pub pending: Option<Op>,
+    /// The service limit, once known (shown next to the size of the secret).
+    pub limit: Option<usize>,
+    /// Ask the service for its limit (the event loop does it outside the state machine).
+    pub wants_limit: bool,
     /// Click areas of the last frame.
-    hits: std::cell::RefCell<Hits>,
+    pub hits: RefCell<Hits>,
+    /// The last frame was smaller than 80×24: only its message was drawn, input waits.
+    pub too_small: Cell<bool>,
     clip: Box<dyn Clip>,
     clip_warned: bool,
     clear: Option<PendingClear>,
@@ -333,17 +403,128 @@ pub struct App {
 }
 
 const CLIP_WARNING: &str =
-    "Clipboard managers may keep a history of what you copy. Press the key again to copy.";
+    "Clipboard managers may keep a history of what you copy. Press again to copy.";
+
+fn press(c: KeyCode) -> KeyEvent {
+    KeyEvent::new(c, KeyModifiers::NONE)
+}
+
+/// Buttons of a screen (other than New secret, Home and Revealed, which have their own).
+pub fn link_form_buttons() -> Vec<Button<Action>> {
+    vec![
+        Button::new("Check link", "Enter", Action::CheckLink, Role::Primary),
+        Button::new("Back", "Esc", Action::Back, Role::Secondary),
+    ]
+}
+
+pub fn created_buttons(v: &CreatedView) -> Vec<Button<Action>> {
+    let mut b = vec![
+        Button::new(
+            "Copy recipient link",
+            "c",
+            Action::CopyRecipient,
+            Role::Primary,
+        ),
+        // Drawn as the `[+]` line that shows the private sender link.
+        Button::new(
+            "Only for you: track or revoke",
+            "o",
+            Action::ToggleOwner,
+            Role::Secondary,
+        ),
+    ];
+    if v.show_owner {
+        b.push(Button::new(
+            "Copy private sender link",
+            "y",
+            Action::CopyOwner,
+            Role::Secondary,
+        ));
+    }
+    b.push(Button::new(
+        "New secret",
+        "n",
+        Action::NewSecret,
+        Role::Secondary,
+    ));
+    b.push(Button::new("Home", "Esc", Action::Back, Role::Secondary));
+    b
+}
+
+pub fn reveal_buttons() -> Vec<Button<Action>> {
+    vec![
+        Button::new("Reveal secret", "Enter", Action::Reveal, Role::Primary),
+        Button::new("Back", "Esc", Action::Back, Role::Secondary),
+    ]
+}
+
+pub fn unlock_buttons() -> Vec<Button<Action>> {
+    vec![
+        Button::new("Decrypt", "Enter", Action::Decrypt, Role::Primary),
+        Button::new("Discard", "Esc", Action::Back, Role::Danger),
+    ]
+}
+
+pub fn revealed_buttons(v: &RevealedView) -> Vec<Button<Action>> {
+    if v.saving {
+        return vec![
+            Button::new("Save", "Enter", Action::Save, Role::Primary),
+            Button::new("Cancel", "Esc", Action::CancelSave, Role::Secondary),
+        ];
+    }
+    let mut b = Vec::new();
+    if !v.text().is_empty() {
+        b.push(Button::new(
+            "Copy text",
+            "c",
+            Action::CopyText,
+            Role::Primary,
+        ));
+    }
+    b.push(Button::new(
+        if v.has_files() {
+            "Save files"
+        } else {
+            "Save to a file"
+        },
+        "s",
+        Action::StartSave,
+        if v.text().is_empty() {
+            Role::Primary
+        } else {
+            Role::Secondary
+        },
+    ));
+    b.push(Button::new("Leave", "Esc", Action::Back, Role::Secondary));
+    b
+}
+
+pub fn status_buttons(v: &StatusView) -> Vec<Button<Action>> {
+    vec![
+        Button::new("Check status", "r", Action::RefreshStatus, Role::Primary),
+        Button::new("Revoke", "x", Action::AskRevoke, Role::Danger)
+            .enabled(v.status.state == "stored"),
+        Button::new("Home", "Esc", Action::Back, Role::Secondary),
+    ]
+}
+
+/// Focus list of the screens with a field and buttons: 0 is the field (when there).
+fn field_and_buttons(has_field: bool, buttons: usize) -> usize {
+    usize::from(has_field) + buttons
+}
 
 impl App {
     pub fn new(clip: Box<dyn Clip>) -> App {
         App {
             screen: Screen::Home { selected: 0 },
+            dialog: None,
             quit: false,
-            leave_armed: false,
             message: None,
             pending: None,
-            hits: std::cell::RefCell::new(Vec::new()),
+            limit: None,
+            wants_limit: false,
+            hits: RefCell::new(Vec::new()),
+            too_small: Cell::new(false),
             clip,
             clip_warned: false,
             clear: None,
@@ -377,7 +558,9 @@ impl App {
                         at: self.now + CLEAR_AFTER,
                         hash,
                     });
-                    self.note(format!("{what} copied; it is removed from the clipboard in 60 seconds."));
+                    self.note(format!(
+                        "{what} copied; it is removed from the clipboard in 60 seconds."
+                    ));
                 } else {
                     self.note(format!("{what} copied."));
                 }
@@ -424,172 +607,95 @@ impl App {
         }
     }
 
-    /// Leaving a screen that holds a fetched secret needs the key twice.
-    fn may_leave(&mut self) -> bool {
-        if !self.screen.holds_secret() || self.leave_armed {
-            return true;
+    fn go(&mut self, screen: Screen) {
+        let new = matches!(screen, Screen::New(_));
+        self.screen = screen;
+        self.dialog = None;
+        if new && self.limit.is_none() {
+            self.wants_limit = true;
         }
-        self.leave_armed = true;
-        self.error(
-            "The secret exists only here now: leaving destroys it. Press the key again to leave.",
-        );
-        false
+    }
+
+    /// Leave the screen (Home) or the app; a screen that holds a fetched secret asks first.
+    fn leave(&mut self, intent: Intent) {
+        let kind = match &self.screen {
+            Screen::Unlock(_) => DialogKind::Discard(intent),
+            s if s.holds_secret() => DialogKind::LeaveUnsaved(intent),
+            _ => return self.finish(intent),
+        };
+        self.dialog = Some(Dialog { kind, focus: 0 });
+    }
+
+    fn finish(&mut self, intent: Intent) {
+        match intent {
+            Intent::Home => self.go(Screen::Home { selected: 0 }),
+            Intent::Quit => self.quit = true,
+        }
+    }
+
+    pub fn render(&self, f: &mut ratatui::Frame) {
+        super::view::render(self, f);
     }
 
     pub fn key(&mut self, k: KeyEvent) {
-        self.message = None;
-        let open = matches!(self.screen, Screen::Open(_));
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-        let typing_dir = matches!(&self.screen, Screen::Revealed(v) if v.saving);
-        let leaving =
-            (ctrl && k.code == KeyCode::Char('c')) || (k.code == KeyCode::Esc && !typing_dir);
-        if !leaving {
-            self.leave_armed = false;
-        }
-        if ctrl && k.code == KeyCode::Char('c') {
-            if self.may_leave() {
-                self.quit = true;
+        if self.too_small.get() {
+            // Nothing on the screen to act on; only quitting (asks first if a secret is held).
+            if ctrl && k.code == KeyCode::Char('c') && self.dialog.is_none() {
+                self.leave(Intent::Quit);
             }
             return;
         }
-        match &mut self.screen {
-            Screen::Home { selected } => match k.code {
-                KeyCode::Up | KeyCode::Char('k') => {
-                    *selected = (*selected + HOME_ITEMS.len() - 1) % HOME_ITEMS.len();
-                }
-                KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
-                    *selected = (*selected + 1) % HOME_ITEMS.len();
-                }
-                KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
-                KeyCode::Enter => match *selected {
-                    0 => self.screen = Screen::New(Box::new(NewForm::new())),
-                    1 => self.screen = Screen::Open(Input::new(false)),
-                    2 => self.screen = Screen::StatusForm(Input::new(false)),
-                    _ => self.quit = true,
-                },
-                _ => {}
-            },
+        self.message = None;
+        if self.dialog.is_some() {
+            return self.key_dialog(k);
+        }
+        if ctrl && k.code == KeyCode::Char('c') {
+            return self.leave(Intent::Quit);
+        }
+        match &self.screen {
+            Screen::Home { .. } => self.key_home(k),
             Screen::New(_) => self.key_new(k),
-            Screen::Created(_) => self.key_created(k),
-            Screen::Open(link) | Screen::StatusForm(link) => match k.code {
-                KeyCode::Esc => self.screen = Screen::Home { selected: 0 },
-                KeyCode::Enter if link.text().trim().is_empty() => {
-                    self.error("Paste the link first.");
-                }
-                KeyCode::Enter => {
-                    self.pending = Some(if open { Op::OpenLink } else { Op::LoadStatus });
-                }
-                _ => {
-                    edit(link, k);
-                }
-            },
-            Screen::Reveal(v) => match k.code {
-                KeyCode::Esc => self.screen = Screen::Home { selected: 0 },
-                KeyCode::Enter if v.link.passphrase_hint && v.pass.text().is_empty() => {
-                    self.error("Type the passphrase first.");
-                }
-                KeyCode::Enter => {
-                    self.pending = Some(Op::Consume);
-                    self.note("Fetching and decrypting…");
-                }
-                _ if v.link.passphrase_hint => {
-                    edit(&mut v.pass, k);
-                }
-                _ => {}
-            },
-            Screen::Unlock(v) => match k.code {
-                KeyCode::Esc => {
-                    if self.may_leave() {
-                        self.screen = Screen::Home { selected: 0 };
-                    }
-                }
-                KeyCode::Enter if v.pass.text().is_empty() => {
-                    self.error("Type the passphrase. The secret is kept only in memory now.");
-                }
-                KeyCode::Enter => {
-                    self.pending = Some(Op::Unlock);
-                    self.note("Decrypting…");
-                }
-                _ => {
-                    edit(&mut v.pass, k);
-                }
-            },
             Screen::Revealed(_) => self.key_revealed(k),
-            Screen::Status(v) => match k.code {
-                KeyCode::Esc | KeyCode::Char('q') => self.screen = Screen::Home { selected: 0 },
-                KeyCode::Char('r') => {
-                    v.confirm_revoke = false;
-                    self.pending = Some(Op::RefreshStatus);
-                }
-                KeyCode::Char('x') if v.status.state == "stored" => {
-                    if v.confirm_revoke {
-                        v.confirm_revoke = false;
-                        self.pending = Some(Op::Revoke);
-                    } else {
-                        v.confirm_revoke = true;
-                        self.error(
-                            "Revoke: the link stops working for good. Press x again to revoke.",
-                        );
-                    }
-                }
-                _ => v.confirm_revoke = false,
-            },
+            _ => self.key_simple(k),
         }
     }
 
-    fn key_revealed(&mut self, k: KeyEvent) {
-        let Screen::Revealed(v) = &mut self.screen else {
+    fn key_dialog(&mut self, k: KeyEvent) {
+        let Some(d) = &mut self.dialog else {
             return;
         };
-        if v.saving {
-            match k.code {
-                KeyCode::Esc => v.saving = false,
-                KeyCode::Enter => {
-                    self.pending = Some(Op::Save);
-                    self.note("Saving…");
-                }
-                _ => {
-                    edit(&mut v.dir, k);
-                }
-            }
-            return;
-        }
-        // The terminal may have grown since the scroll was set: clamp the state, not only the view.
-        v.scroll = v.scroll.min(v.max_scroll.get());
+        let n = d.buttons().len();
         match k.code {
-            KeyCode::Up => v.scroll = v.scroll.saturating_sub(1),
-            KeyCode::Down => v.scroll = (v.scroll + 1).min(v.max_scroll.get()),
-            KeyCode::PageUp => v.scroll = v.scroll.saturating_sub(10),
-            KeyCode::PageDown => v.scroll = (v.scroll + 10).min(v.max_scroll.get()),
-            KeyCode::Char('c') if !v.text().is_empty() => {
-                let text = Zeroizing::new(v.text().to_owned());
-                self.copy(&text, "The secret", true);
+            KeyCode::Tab | KeyCode::Right | KeyCode::Down => d.focus = (d.focus + 1) % n,
+            KeyCode::BackTab | KeyCode::Left | KeyCode::Up => d.focus = (d.focus + n - 1) % n,
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                let i = d.focus;
+                self.act(Action::Choose(i));
             }
-            KeyCode::Char('s') => {
-                v.saving = true;
-                v.dir.clear();
-            }
-            // may_leave warns on the first press when unsaved files would be lost.
-            KeyCode::Esc if self.may_leave() => self.screen = Screen::Home { selected: 0 },
+            // Esc (and Ctrl+C) cancel: nothing is left or revoked.
+            KeyCode::Esc => self.dialog = None,
+            KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => self.dialog = None,
             _ => {}
         }
     }
 
-    pub fn paste(&mut self, text: &str) {
-        match &mut self.screen {
-            Screen::New(f) => match f.focus {
-                NewFocus::Text => f.text.insert(text),
-                NewFocus::Path => f.path.insert(text),
-                NewFocus::Pass => {
-                    f.pass.insert(text);
-                    f.generated = false;
-                }
-                _ => {}
-            },
-            Screen::Open(i) | Screen::StatusForm(i) => i.insert(text.trim()),
-            Screen::Reveal(v) if v.link.passphrase_hint => v.pass.insert(text),
-            Screen::Unlock(v) => v.pass.insert(text),
-            Screen::Revealed(v) if v.saving => v.dir.insert(text.trim()),
+    fn key_home(&mut self, k: KeyEvent) {
+        let Screen::Home { selected } = &mut self.screen else {
+            return;
+        };
+        match k.code {
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+                *selected = (*selected + HOME_ITEMS.len() - 1) % HOME_ITEMS.len();
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                *selected = (*selected + 1) % HOME_ITEMS.len();
+            }
+            KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+            KeyCode::Enter => {
+                let i = *selected;
+                self.act(Action::Open(i));
+            }
             _ => {}
         }
     }
@@ -600,15 +706,12 @@ impl App {
         };
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match k.code {
-            KeyCode::Esc => {
-                self.screen = Screen::Home { selected: 0 };
-                return;
-            }
+            KeyCode::Esc => return self.act(Action::Back),
             KeyCode::Tab => return f.step(false),
             KeyCode::BackTab => return f.step(true),
             // Create from any field: Ctrl+S everywhere; Shift/Cmd/Ctrl+Enter where the terminal
             // reports the modifier (keyboard enhancement).
-            KeyCode::Char('s') if ctrl => return self.request_create(),
+            KeyCode::Char('s') if ctrl => return self.act(Action::Create),
             KeyCode::Enter
                 if k.modifiers.intersects(
                     KeyModifiers::SHIFT
@@ -618,46 +721,26 @@ impl App {
                         | KeyModifiers::META,
                 ) =>
             {
-                return self.request_create();
+                return self.act(Action::Create);
             }
-            // A random passphrase, when the passphrase is on (the secret itself is the user's).
-            KeyCode::Char('g') if ctrl => {
-                if f.use_pass {
-                    f.pass.set(&crate::password::generate());
-                    f.generated = true;
-                    f.focus = NewFocus::Pass;
-                    self.note("Send the passphrase through a different channel than the link.");
-                } else {
-                    self.error("Turn on the passphrase first (Space).");
-                }
-                return;
-            }
+            KeyCode::Char('g') if ctrl => return self.act(Action::GeneratePassphrase),
             _ => {}
         }
+        let activate = matches!(k.code, KeyCode::Enter | KeyCode::Char(' '));
         match f.focus {
             NewFocus::Text => {
                 edit(&mut f.text, k);
             }
+            NewFocus::Path if k.code == KeyCode::Enter => self.act(Action::AddFile),
             NewFocus::Path => {
-                if k.code == KeyCode::Enter {
-                    let added = add_file(f);
-                    match added {
-                        Ok(()) => {}
-                        Err(e) => self.error(e),
-                    }
-                } else {
-                    edit(&mut f.path, k);
-                }
+                edit(&mut f.path, k);
             }
             NewFocus::Files => match k.code {
                 KeyCode::Up => f.file_sel = f.file_sel.saturating_sub(1),
                 KeyCode::Down => f.file_sel = (f.file_sel + 1).min(f.files.len().saturating_sub(1)),
-                KeyCode::Delete | KeyCode::Backspace if f.file_sel < f.files.len() => {
-                    f.files.remove(f.file_sel);
-                    f.file_sel = f.file_sel.min(f.files.len().saturating_sub(1));
-                    if f.files.is_empty() {
-                        f.focus = NewFocus::Path;
-                    }
+                KeyCode::Delete | KeyCode::Backspace => {
+                    let i = f.file_sel;
+                    self.act(Action::RemoveFile(i));
                 }
                 _ => {}
             },
@@ -666,42 +749,359 @@ impl App {
                 KeyCode::Right => f.ttl = (f.ttl + 1).min(TTLS.len() - 1),
                 _ => {}
             },
-            NewFocus::UsePass => {
-                if matches!(k.code, KeyCode::Char(' ') | KeyCode::Enter) {
-                    f.use_pass = !f.use_pass;
-                    if !f.use_pass {
-                        f.pass.clear();
-                    }
-                }
-            }
+            NewFocus::UsePass if activate => self.act(Action::TogglePassphrase),
             NewFocus::Pass => {
                 if edit(&mut f.pass, k) {
                     f.generated = false;
                 }
             }
-            NewFocus::Create => {
-                if k.code == KeyCode::Enter {
-                    self.request_create();
-                }
-            }
+            NewFocus::Add if activate => self.act(Action::AddFile),
+            NewFocus::Generate if activate => self.act(Action::GeneratePassphrase),
+            NewFocus::Create if activate => self.act(Action::Create),
+            NewFocus::Back if activate => self.act(Action::Back),
+            _ => {}
         }
     }
 
-    fn request_create(&mut self) {
-        let Screen::New(f) = &self.screen else {
+    /// Screens made of an optional field and a row of buttons: Link ready, Open a link, Check
+    /// status, Reveal, Unlock, Status.
+    fn key_simple(&mut self, k: KeyEvent) {
+        let (has_field, buttons) = self.simple_parts();
+        let n = field_and_buttons(has_field, buttons.len());
+        let focus = self.simple_focus();
+        let on_field = has_field && focus == 0;
+        match k.code {
+            KeyCode::Tab => return self.set_simple_focus((focus + 1) % n),
+            KeyCode::BackTab => return self.set_simple_focus((focus + n - 1) % n),
+            KeyCode::Esc => return self.act(Action::Back),
+            KeyCode::Enter | KeyCode::Char(' ') if !on_field || k.code == KeyCode::Enter => {
+                let action = if on_field {
+                    // Enter in the field: the screen's main action.
+                    buttons[0].action
+                } else {
+                    buttons[focus - usize::from(has_field)].action
+                };
+                return self.act(action);
+            }
+            _ => {}
+        }
+        if on_field {
+            if let Some(i) = self.simple_field() {
+                edit(i, k);
+            }
+            return;
+        }
+        // Shortcut letters of the buttons (shown in their parentheses).
+        if let KeyCode::Char(c) = k.code
+            && let Some(b) = buttons
+                .iter()
+                .find(|b| b.key.len() == 1 && b.key.starts_with(c) && b.enabled)
+        {
+            let action = b.action;
+            self.act(action);
+        }
+    }
+
+    fn simple_parts(&self) -> (bool, Vec<Button<Action>>) {
+        match &self.screen {
+            Screen::Created(v) => (false, created_buttons(v)),
+            Screen::Open(_) | Screen::StatusForm(_) => (true, link_form_buttons()),
+            Screen::Reveal(v) => (v.link.passphrase_hint, reveal_buttons()),
+            Screen::Unlock(_) => (true, unlock_buttons()),
+            Screen::Status(v) => (false, status_buttons(v)),
+            _ => (false, Vec::new()),
+        }
+    }
+
+    pub fn simple_focus(&self) -> usize {
+        match &self.screen {
+            Screen::Created(v) => v.focus,
+            Screen::Open(f) | Screen::StatusForm(f) => f.focus,
+            Screen::Reveal(v) => v.focus,
+            Screen::Unlock(v) => v.focus,
+            Screen::Status(v) => v.focus,
+            _ => 0,
+        }
+    }
+
+    fn set_simple_focus(&mut self, to: usize) {
+        match &mut self.screen {
+            Screen::Created(v) => v.focus = to,
+            Screen::Open(f) | Screen::StatusForm(f) => f.focus = to,
+            Screen::Reveal(v) => v.focus = to,
+            Screen::Unlock(v) => v.focus = to,
+            Screen::Status(v) => v.focus = to,
+            _ => {}
+        }
+    }
+
+    fn simple_field(&mut self) -> Option<&mut Input> {
+        match &mut self.screen {
+            Screen::Open(f) | Screen::StatusForm(f) => Some(&mut f.input),
+            Screen::Reveal(v) if v.link.passphrase_hint => Some(&mut v.pass),
+            Screen::Unlock(v) => Some(&mut v.pass),
+            _ => None,
+        }
+    }
+
+    fn key_revealed(&mut self, k: KeyEvent) {
+        let Screen::Revealed(v) = &mut self.screen else {
             return;
         };
-        if f.text.text().is_empty() && f.files.is_empty() {
-            self.error("Enter a secret or add a file.");
-        } else if f.use_pass && f.pass.text().is_empty() {
-            self.error("Enter a passphrase or turn it off.");
-        } else {
-            self.pending = Some(Op::Create);
-            self.note("Encrypting and creating…");
+        let order = v.order();
+        let at = order.iter().position(|f| *f == v.focus).unwrap_or(0);
+        let buttons = revealed_buttons(v);
+        match k.code {
+            KeyCode::Tab => {
+                v.focus = order[(at + 1) % order.len()];
+                return;
+            }
+            KeyCode::BackTab => {
+                v.focus = order[(at + order.len() - 1) % order.len()];
+                return;
+            }
+            KeyCode::Esc => {
+                let a = if v.saving {
+                    Action::CancelSave
+                } else {
+                    Action::Back
+                };
+                return self.act(a);
+            }
+            _ => {}
+        }
+        // The terminal may have grown since the scroll was set: clamp the state, not only the view.
+        v.scroll = v.scroll.min(v.max_scroll.get());
+        v.file_top = v.file_top.min(v.max_file_top.get());
+        match (v.focus, k.code) {
+            (RevealedFocus::Dir, KeyCode::Enter) => self.act(Action::Save),
+            (RevealedFocus::Dir, _) => {
+                edit(&mut v.dir, k);
+            }
+            (RevealedFocus::Button(i), KeyCode::Enter | KeyCode::Char(' ')) => {
+                if let Some(b) = buttons.get(i) {
+                    let action = b.action;
+                    self.act(action);
+                }
+            }
+            (RevealedFocus::Files, KeyCode::Up) => v.file_top = v.file_top.saturating_sub(1),
+            (RevealedFocus::Files, KeyCode::Down) => {
+                v.file_top = (v.file_top + 1).min(v.max_file_top.get())
+            }
+            (_, KeyCode::Up) => v.scroll = v.scroll.saturating_sub(1),
+            (_, KeyCode::Down) => v.scroll = (v.scroll + 1).min(v.max_scroll.get()),
+            (_, KeyCode::PageUp) => v.scroll = v.scroll.saturating_sub(10),
+            (_, KeyCode::PageDown) => v.scroll = (v.scroll + 10).min(v.max_scroll.get()),
+            (_, KeyCode::Char(c)) => {
+                if let Some(b) = buttons
+                    .iter()
+                    .find(|b| b.key.len() == 1 && b.key.starts_with(c))
+                {
+                    let action = b.action;
+                    self.act(action);
+                }
+            }
+            _ => {}
         }
     }
 
-    /// A mouse event: clicks act like the key of what was hit; the wheel scrolls.
+    pub fn paste(&mut self, text: &str) {
+        if self.dialog.is_some() || self.too_small.get() {
+            return;
+        }
+        match &mut self.screen {
+            Screen::New(f) => match f.focus {
+                NewFocus::Text => f.text.insert(text),
+                NewFocus::Path => f.path.insert(text),
+                NewFocus::Pass => {
+                    f.pass.insert(text);
+                    f.generated = false;
+                }
+                _ => {}
+            },
+            Screen::Open(f) | Screen::StatusForm(f) if f.focus == 0 => f.input.insert(text.trim()),
+            Screen::Reveal(v) if v.link.passphrase_hint && v.focus == 0 => v.pass.insert(text),
+            Screen::Unlock(v) if v.focus == 0 => v.pass.insert(text),
+            Screen::Revealed(v) if v.focus == RevealedFocus::Dir => v.dir.insert(text.trim()),
+            _ => {}
+        }
+    }
+
+    /// Run an action: keys, buttons and clicks all end here.
+    pub fn act(&mut self, a: Action) {
+        if let Action::Choose(i) = a {
+            return self.choose(i);
+        }
+        match &mut self.screen {
+            Screen::Home { .. } => {
+                if let Action::Open(i) = a {
+                    match i {
+                        0 => self.go(Screen::New(Box::new(NewForm::new()))),
+                        1 => self.go(Screen::Open(LinkForm {
+                            input: Input::new(false),
+                            focus: 0,
+                        })),
+                        2 => self.go(Screen::StatusForm(LinkForm {
+                            input: Input::new(false),
+                            focus: 0,
+                        })),
+                        _ => self.quit = true,
+                    }
+                }
+            }
+            Screen::New(f) => match a {
+                Action::AddFile => {
+                    if let Err(e) = add_file(f) {
+                        self.error(e);
+                    }
+                }
+                Action::RemoveFile(i) if i < f.files.len() => {
+                    f.files.remove(i);
+                    f.file_sel = f.file_sel.min(f.files.len().saturating_sub(1));
+                    if f.files.is_empty() && f.focus == NewFocus::Files {
+                        f.focus = NewFocus::Path;
+                    }
+                }
+                Action::SelectFile(i) if i < f.files.len() => {
+                    f.file_sel = i;
+                    f.focus = NewFocus::Files;
+                }
+                Action::SetTtl(i) if i < TTLS.len() => {
+                    f.ttl = i;
+                    f.focus = NewFocus::Ttl;
+                }
+                Action::TogglePassphrase => {
+                    f.use_pass = !f.use_pass;
+                    f.focus = NewFocus::UsePass;
+                    if !f.use_pass {
+                        f.pass.clear();
+                        f.generated = false;
+                    }
+                }
+                // A random passphrase, when the passphrase is on (the secret itself is the user's).
+                Action::GeneratePassphrase => {
+                    if f.use_pass {
+                        f.pass.set(&crate::password::generate());
+                        f.generated = true;
+                        self.note("Send the passphrase through a separate channel.");
+                    } else {
+                        self.error("Turn on the passphrase first (Space).");
+                    }
+                }
+                Action::Create => {
+                    if f.text.text().is_empty() && f.files.is_empty() {
+                        self.error("Enter a secret or add a file.");
+                    } else if f.use_pass && f.pass.text().is_empty() {
+                        self.error("Enter a passphrase or turn it off.");
+                    } else {
+                        self.pending = Some(Op::Create);
+                        self.note("Encrypting and creating…");
+                    }
+                }
+                Action::Back => self.go(Screen::Home { selected: 0 }),
+                _ => {}
+            },
+            Screen::Created(v) => match a {
+                Action::CopyRecipient => {
+                    let link = v.recipient.clone();
+                    self.copy(&link, "Recipient link", false);
+                }
+                Action::ToggleOwner => v.show_owner = !v.show_owner,
+                Action::CopyOwner if v.show_owner => {
+                    let link = v.owner.clone();
+                    self.copy(&link, "Private sender link", false);
+                }
+                Action::NewSecret => self.go(Screen::New(Box::new(NewForm::new()))),
+                Action::Back => self.go(Screen::Home { selected: 0 }),
+                _ => {}
+            },
+            Screen::Open(f) | Screen::StatusForm(f) => match a {
+                Action::CheckLink if f.input.text().trim().is_empty() => {
+                    self.error("Paste the link first.");
+                }
+                Action::CheckLink => {
+                    let open = matches!(self.screen, Screen::Open(_));
+                    self.pending = Some(if open { Op::OpenLink } else { Op::LoadStatus });
+                }
+                Action::Back => self.go(Screen::Home { selected: 0 }),
+                _ => {}
+            },
+            Screen::Reveal(v) => match a {
+                Action::Reveal if v.link.passphrase_hint && v.pass.text().is_empty() => {
+                    v.focus = 0;
+                    self.error("Type the passphrase first.");
+                }
+                Action::Reveal => {
+                    self.pending = Some(Op::Consume);
+                    self.note("Fetching and decrypting…");
+                }
+                Action::Back => self.go(Screen::Home { selected: 0 }),
+                _ => {}
+            },
+            Screen::Unlock(v) => match a {
+                Action::Decrypt if v.pass.text().is_empty() => {
+                    v.focus = 0;
+                    self.error("Type the passphrase. The secret is kept only in memory now.");
+                }
+                Action::Decrypt => {
+                    self.pending = Some(Op::Unlock);
+                    self.note("Decrypting…");
+                }
+                Action::Back => self.leave(Intent::Home),
+                _ => {}
+            },
+            Screen::Revealed(v) => match a {
+                Action::CopyText if !v.text().is_empty() => {
+                    let text = Zeroizing::new(v.text().to_owned());
+                    self.copy(&text, "The secret", true);
+                }
+                Action::StartSave => {
+                    v.saving = true;
+                    v.dir.clear();
+                    v.focus = RevealedFocus::Dir;
+                }
+                Action::Save => {
+                    self.pending = Some(Op::Save);
+                    self.note("Saving…");
+                }
+                Action::CancelSave => {
+                    v.saving = false;
+                    v.focus = RevealedFocus::Button(0);
+                }
+                Action::Back => self.leave(Intent::Home),
+                _ => {}
+            },
+            Screen::Status(v) => match a {
+                Action::RefreshStatus => self.pending = Some(Op::RefreshStatus),
+                Action::AskRevoke if v.status.state == "stored" => {
+                    self.dialog = Some(Dialog {
+                        kind: DialogKind::Revoke,
+                        focus: 0,
+                    });
+                }
+                Action::Back => self.go(Screen::Home { selected: 0 }),
+                _ => {}
+            },
+        }
+    }
+
+    /// A dialog choice; index 0 is always the safe one (nothing changes).
+    fn choose(&mut self, i: usize) {
+        let Some(d) = self.dialog.take() else {
+            return;
+        };
+        match (d.kind, i) {
+            (DialogKind::LeaveUnsaved(_), 1) => self.act(Action::StartSave),
+            (DialogKind::LeaveUnsaved(intent), 2) | (DialogKind::Discard(intent), 1) => {
+                self.finish(intent)
+            }
+            (DialogKind::Revoke, 1) => self.pending = Some(Op::Revoke),
+            _ => {}
+        }
+    }
+
+    /// A mouse event: a click runs the action of what was hit; the wheel scrolls. While a dialog is
+    /// open only its buttons take clicks.
     pub fn mouse(&mut self, m: MouseEvent) {
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {
@@ -717,51 +1117,88 @@ impl App {
                         })
                     })
                     .map(|(_, h)| *h);
+                let Some(hit) = hit else {
+                    return;
+                };
+                self.message = None;
+                if self.dialog.is_some() {
+                    if let Hit::Act(a @ Action::Choose(_), _) = hit {
+                        self.act(a);
+                    }
+                    return;
+                }
                 match hit {
-                    Some(Hit::Key(k)) => self.key(k),
-                    Some(Hit::Home(i)) => {
+                    Hit::Act(a, focus) => {
+                        if let Some(i) = focus {
+                            self.focus_button(i);
+                        }
+                        self.act(a);
+                    }
+                    Hit::Home(i) => {
                         if let Screen::Home { selected } = &mut self.screen {
                             *selected = i;
                         }
-                        self.key(press(KeyCode::Enter));
+                        self.act(Action::Open(i));
                     }
-                    Some(Hit::Focus(to)) => {
+                    Hit::Focus(to) => {
                         if let Screen::New(f) = &mut self.screen {
                             f.focus = to;
                         }
                     }
-                    Some(Hit::Ttl(i)) => {
-                        if let Screen::New(f) = &mut self.screen {
-                            f.ttl = i;
-                            f.focus = NewFocus::Ttl;
+                    Hit::Field => match &mut self.screen {
+                        Screen::Revealed(v) => v.focus = RevealedFocus::Dir,
+                        _ => self.set_simple_focus(0),
+                    },
+                    Hit::RevealedText => {
+                        if let Screen::Revealed(v) = &mut self.screen {
+                            v.focus = RevealedFocus::Text;
                         }
                     }
-                    Some(Hit::PassToggle) => {
-                        if let Screen::New(f) = &mut self.screen {
-                            f.focus = NewFocus::UsePass;
-                        }
-                        self.key(press(KeyCode::Char(' ')));
-                    }
-                    Some(Hit::File(i)) => {
-                        if let Screen::New(f) = &mut self.screen {
-                            f.file_sel = i;
-                            f.focus = NewFocus::Files;
+                    Hit::RevealedFiles => {
+                        if let Screen::Revealed(v) = &mut self.screen {
+                            v.focus = RevealedFocus::Files;
                         }
                     }
-                    None => {}
                 }
             }
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                if self.dialog.is_some() {
+                    return;
+                }
                 let code = if m.kind == MouseEventKind::ScrollDown {
                     KeyCode::Down
                 } else {
                     KeyCode::Up
                 };
-                match &self.screen {
+                match &mut self.screen {
                     Screen::Revealed(v) if !v.saving => {
+                        // The wheel scrolls the list it is over, else the text.
+                        let over_files = self.hits.borrow().iter().any(|(r, h)| {
+                            *h == Hit::RevealedFiles
+                                && r.contains(ratatui::layout::Position {
+                                    x: m.column,
+                                    y: m.row,
+                                })
+                        });
+                        let focus = v.focus;
+                        v.focus = if over_files {
+                            RevealedFocus::Files
+                        } else {
+                            RevealedFocus::Text
+                        };
                         for _ in 0..3 {
                             self.key(press(code));
                         }
+                        if let Screen::Revealed(v) = &mut self.screen {
+                            v.focus = focus;
+                        }
+                    }
+                    Screen::New(f) if !f.files.is_empty() => {
+                        f.file_sel = if code == KeyCode::Down {
+                            (f.file_sel + 1).min(f.files.len() - 1)
+                        } else {
+                            f.file_sel.saturating_sub(1)
+                        };
                     }
                     Screen::Home { .. } => self.key(press(code)),
                     _ => {}
@@ -771,23 +1208,20 @@ impl App {
         }
     }
 
-    fn key_created(&mut self, k: KeyEvent) {
-        let Screen::Created(v) = &mut self.screen else {
-            return;
-        };
-        match k.code {
-            KeyCode::Char('c') => {
-                let link = v.recipient.clone();
-                self.copy(&link, "The link", false);
+    /// Move the focus to the `i`-th focusable item of the screen (a clicked button).
+    fn focus_button(&mut self, i: usize) {
+        match &mut self.screen {
+            Screen::New(f) => {
+                if let Some(to) = f.order().get(i) {
+                    f.focus = *to;
+                }
             }
-            KeyCode::Char('o') => v.show_owner = !v.show_owner,
-            KeyCode::Char('y') if v.show_owner => {
-                let link = v.owner.clone();
-                self.copy(&link, "Your status link", false);
+            Screen::Revealed(v) => {
+                if let Some(to) = v.order().get(i) {
+                    v.focus = *to;
+                }
             }
-            KeyCode::Char('n') => self.screen = Screen::New(Box::new(NewForm::new())),
-            KeyCode::Esc | KeyCode::Char('q') => self.screen = Screen::Home { selected: 0 },
-            _ => {}
+            _ => self.set_simple_focus(i),
         }
     }
 
@@ -799,17 +1233,20 @@ impl App {
         self.message = None;
         match (op, &mut self.screen) {
             (Op::Create, Screen::New(f)) => match create(f, client) {
-                Ok(v) => self.screen = Screen::Created(v),
+                Ok((v, limit)) => {
+                    self.limit = Some(limit);
+                    self.go(Screen::Created(v));
+                }
                 Err(e) => self.error(e.to_string()),
             },
             // The link is checked against the trusted origin: no request is sent.
-            (Op::OpenLink, Screen::Open(i)) => match client.recipient_link(i.text().trim()) {
-                Ok(link) => {
-                    self.screen = Screen::Reveal(Box::new(RevealView {
-                        link,
-                        pass: Input::new(false),
-                    }))
-                }
+            (Op::OpenLink, Screen::Open(f)) => match client.recipient_link(f.input.text().trim()) {
+                // The focus starts on the passphrase field if there is one, else on Reveal.
+                Ok(link) => self.go(Screen::Reveal(Box::new(RevealView {
+                    link,
+                    pass: Input::new(false),
+                    focus: 0,
+                }))),
                 Err(e) => self.error(e.to_string()),
             },
             (Op::Consume, Screen::Reveal(v)) => {
@@ -836,12 +1273,13 @@ impl App {
                     }
                     Err(FormatError::DecryptFailed) => {
                         v.pass.clear();
+                        v.focus = 0;
                         self.error(
-                            "Wrong passphrase. The secret is already deleted from the server; try again.",
+                            "Wrong passphrase. Retry locally; the server copy is already deleted.",
                         );
                     }
                     Err(e) => {
-                        self.screen = Screen::Home { selected: 0 };
+                        self.go(Screen::Home { selected: 0 });
                         self.error(CliError::from(e).to_string());
                     }
                 }
@@ -863,6 +1301,7 @@ impl App {
                         let shown = crate::api::printable(&dir.display().to_string());
                         v.saving = false;
                         v.saved = Some(shown.clone());
+                        v.focus = RevealedFocus::Button(0);
                         self.note(format!("Saved {n} file(s) to {shown}."));
                     }
                     Err(e) => {
@@ -874,17 +1313,17 @@ impl App {
                     }
                 }
             }
-            (Op::LoadStatus, Screen::StatusForm(i)) => {
+            (Op::LoadStatus, Screen::StatusForm(f)) => {
                 let result = client
-                    .owner_link(i.text().trim())
+                    .owner_link(f.input.text().trim())
                     .and_then(|link| client.status(&link).map(|s| (link, s)));
                 match result {
                     Ok((link, status)) => {
-                        self.screen = Screen::Status(Box::new(StatusView {
+                        self.go(Screen::Status(Box::new(StatusView {
                             link,
                             status,
-                            confirm_revoke: false,
-                        }));
+                            focus: 0,
+                        })));
                         self.note("Checked just now.");
                     }
                     Err(e) => self.error(e.to_string()),
@@ -903,11 +1342,12 @@ impl App {
                         Ok(s) => v.status = s,
                         Err(_) => v.status.state = "revoked".into(),
                     }
-                    self.note("Revoked: the link no longer works.");
+                    v.focus = 0;
+                    self.note("Revoked: the recipient link no longer works.");
                 }
                 Ok(Revoked::AlreadyRead(s)) => {
                     v.status = s;
-                    self.error("Already read, cannot revoke.");
+                    self.error("Already opened, cannot revoke.");
                 }
                 Err(e) => self.error(e.to_string()),
             },
@@ -926,19 +1366,20 @@ impl App {
             Ok(secret) => self.reveal(link.id.clone(), secret),
             Err(e @ (FormatError::NeedPassphrase | FormatError::DecryptFailed)) => {
                 let wrong = e == FormatError::DecryptFailed;
-                self.screen = Screen::Unlock(Box::new(UnlockView {
+                self.go(Screen::Unlock(Box::new(UnlockView {
                     link,
                     envelope,
                     pass: Input::new(false),
-                }));
+                    focus: 0,
+                })));
                 self.error(if wrong {
-                    "Wrong passphrase. The secret is already deleted from the server; try again."
+                    "Wrong passphrase. Retry locally; the server copy is already deleted."
                 } else {
-                    "This secret is protected with a passphrase. It is already deleted from the server; leaving now destroys it."
+                    "This secret has a passphrase. The server copy is already deleted; leaving now destroys it."
                 });
             }
             Err(e) => {
-                self.screen = Screen::Home { selected: 0 };
+                self.go(Screen::Home { selected: 0 });
                 self.error(CliError::from(e).to_string());
             }
         }
@@ -946,189 +1387,25 @@ impl App {
 
     pub fn reveal(&mut self, id: String, secret: Secret) {
         let has_files = !matches!(secret, Secret::Text(_));
-        self.screen = Screen::Revealed(Box::new(RevealedView {
+        let mut v = RevealedView {
             id,
             secret,
             scroll: 0,
-            max_scroll: std::cell::Cell::new(0),
+            max_scroll: Cell::new(0),
+            file_top: 0,
+            max_file_top: Cell::new(0),
             saving: false,
             dir: Input::new(false),
             saved: None,
-        }));
+            focus: RevealedFocus::Button(0),
+        };
+        v.focus = *v.order().first().unwrap_or(&RevealedFocus::Button(0));
+        self.go(Screen::Revealed(Box::new(v)));
         self.note(if has_files {
-            "The secret is deleted from the server. Save the files (s) before leaving."
+            "Deleted from the server. Available in this session: save the files (s)."
         } else {
-            "The secret is deleted from the server. Closing removes it for good."
+            "Deleted from the server. Available in this session."
         });
-    }
-
-    pub fn render(&self, f: &mut Frame) {
-        let mut hits: Hits = Vec::new();
-        let [title, body, msg, footer] = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Min(3),
-            Constraint::Length(2),
-            Constraint::Length(1),
-        ])
-        .areas(f.area());
-        f.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    " payneteasy ",
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("Secrets", Style::default().fg(muted())),
-            ])),
-            title,
-        );
-        let hints = match &self.screen {
-            Screen::Home { .. } => "↑↓ choose · Enter open · q quit",
-            Screen::New(_) => "Tab next · Shift+Tab back · Ctrl+S create · Esc back · mouse: click",
-            Screen::Created(v) if v.show_owner => {
-                "c copy link · y copy status link · o hide · n new · Esc home"
-            }
-            Screen::Created(_) => "c copy link · o show your status link · n new · Esc home",
-            Screen::Open(_) => "paste the recipient link · Enter check · Esc back",
-            Screen::Reveal(_) => "Enter reveal (destroys it on the server) · Esc back",
-            Screen::Unlock(_) => "type the passphrase · Enter decrypt",
-            Screen::Revealed(v) if v.saving => {
-                "new directory (empty: ./sdrop-<id>) · Enter save · Esc cancel"
-            }
-            Screen::Revealed(_) => "↑↓ scroll · c copy text · s save · Esc leave",
-            Screen::StatusForm(_) => "paste your status link · Enter check · Esc back",
-            Screen::Status(_) => "r check status · x revoke · Esc home",
-        };
-        let buttons = self.buttons();
-        // Rows the buttons need at this width (they wrap rather than get cut).
-        let rows = {
-            let (mut rows, mut x) = (1u16, 0u16);
-            for (label, _, _) in &buttons {
-                let w = unicode_width::UnicodeWidthStr::width(label.as_str()) as u16 + 2;
-                if x > 0 && x + w > body.width {
-                    rows += 1;
-                    x = 0;
-                }
-                x += w + 2;
-            }
-            rows
-        };
-        let [body, bar] = Layout::vertical([
-            Constraint::Min(1),
-            Constraint::Length(if buttons.is_empty() { 0 } else { rows + 1 }),
-        ])
-        .areas(body);
-        match &self.screen {
-            Screen::Home { selected } => render_home(f, body, *selected, &mut hits),
-            Screen::New(form) => render_new(f, body, form, &mut hits),
-            Screen::Created(v) => render_created(f, body, v),
-            Screen::Open(i) => render_link_form(f, body, i, " Recipient link "),
-            Screen::StatusForm(i) => render_link_form(f, body, i, " Your status link "),
-            Screen::Reveal(v) => render_reveal(f, body, v),
-            Screen::Unlock(v) => render_unlock(f, body, v),
-            Screen::Revealed(v) => render_revealed(f, body, v),
-            Screen::Status(v) => render_status(f, body, v),
-        }
-        // A blank line, then the buttons.
-        let bar = Rect {
-            y: bar.y + 1,
-            height: bar.height.saturating_sub(1),
-            ..bar
-        };
-        render_buttons(f, bar, &buttons, &mut hits);
-        if let Some((is_error, m)) = &self.message {
-            let style = Style::default().fg(if *is_error { danger() } else { muted() });
-            f.render_widget(
-                Paragraph::new(m.as_str())
-                    .style(style)
-                    .wrap(Wrap { trim: true }),
-                msg,
-            );
-        }
-        f.render_widget(
-            Paragraph::new(hints).style(Style::default().fg(muted())),
-            footer,
-        );
-        *self.hits.borrow_mut() = hits;
-    }
-
-    /// The buttons under the current screen: (label, what a click does, primary).
-    fn buttons(&self) -> Vec<(String, Hit, bool)> {
-        let b = |l: &str, k: KeyEvent, primary: bool| (l.to_string(), Hit::Key(k), primary);
-        match &self.screen {
-            Screen::Home { .. } => vec![],
-            Screen::New(f) => vec![
-                (
-                    if f.focus == NewFocus::Create {
-                        "▶ Create one-time link  Ctrl+S".to_string()
-                    } else {
-                        "Create one-time link  Ctrl+S".to_string()
-                    },
-                    Hit::Key(ctrl('s')),
-                    true,
-                ),
-                b("Back  Esc", press(KeyCode::Esc), false),
-            ],
-            Screen::Created(v) => {
-                let mut v2 = vec![
-                    b("Copy link  c", press(KeyCode::Char('c')), true),
-                    b(
-                        if v.show_owner {
-                            "Hide status link  o"
-                        } else {
-                            "Show my status link  o"
-                        },
-                        press(KeyCode::Char('o')),
-                        false,
-                    ),
-                ];
-                if v.show_owner {
-                    v2.push(b("Copy status link  y", press(KeyCode::Char('y')), false));
-                }
-                v2.push(b("New secret  n", press(KeyCode::Char('n')), false));
-                v2.push(b("Home  Esc", press(KeyCode::Esc), false));
-                v2
-            }
-            Screen::Open(_) | Screen::StatusForm(_) => vec![
-                b("Check link  Enter", press(KeyCode::Enter), true),
-                b("Back  Esc", press(KeyCode::Esc), false),
-            ],
-            Screen::Reveal(_) => vec![
-                b("Reveal secret  Enter", press(KeyCode::Enter), true),
-                b("Back  Esc", press(KeyCode::Esc), false),
-            ],
-            Screen::Unlock(_) => vec![b("Decrypt  Enter", press(KeyCode::Enter), true)],
-            Screen::Revealed(v) if v.saving => vec![
-                b("Save  Enter", press(KeyCode::Enter), true),
-                b("Cancel  Esc", press(KeyCode::Esc), false),
-            ],
-            Screen::Revealed(v) => {
-                let mut v2 = Vec::new();
-                if !v.text().is_empty() {
-                    v2.push(b("Copy text  c", press(KeyCode::Char('c')), true));
-                }
-                v2.push(b(
-                    if v.has_files() {
-                        "Save files  s"
-                    } else {
-                        "Save to a file  s"
-                    },
-                    press(KeyCode::Char('s')),
-                    v.text().is_empty(),
-                ));
-                v2.push(b("Leave  Esc", press(KeyCode::Esc), false));
-                v2
-            }
-            Screen::Status(v) => {
-                let mut v2 = vec![b("Check status  r", press(KeyCode::Char('r')), true)];
-                if v.status.state == "stored" {
-                    v2.push(b("Revoke  x", press(KeyCode::Char('x')), false));
-                }
-                v2.push(b("Home  Esc", press(KeyCode::Esc), false));
-                v2
-            }
-        }
     }
 }
 
@@ -1192,7 +1469,7 @@ fn edit(i: &mut Input, k: KeyEvent) -> bool {
 fn add_file(f: &mut NewForm) -> Result<(), String> {
     let raw = f.path.text().trim();
     if raw.is_empty() {
-        return Err("Type the path of a file, then Enter.".into());
+        return Err("Type the path of a file, then Add.".into());
     }
     if f.files.len() >= format::MAX_FILES {
         return Err(format!("Too many files: at most {}.", format::MAX_FILES));
@@ -1226,8 +1503,9 @@ fn expand_home(p: &str) -> PathBuf {
     }
 }
 
-/// Read the files, compose the one record (FORMAT.md 4), encrypt and create.
-fn create(f: &mut NewForm, client: &mut Client) -> Result<CreatedView, CliError> {
+/// Read the files, compose the one record (FORMAT.md 4), encrypt and create; also the limit the
+/// service reported on the way.
+fn create(f: &mut NewForm, client: &mut Client) -> Result<(CreatedView, usize), CliError> {
     let files = f
         .files
         .iter()
@@ -1239,947 +1517,21 @@ fn create(f: &mut NewForm, client: &mut Client) -> Result<CreatedView, CliError>
     );
     format::encode_plaintext(&content, format::MAX_BUCKET)?;
     let passphrase = f.use_pass.then(|| f.pass.text());
+    let limit = client.limit()?;
     let created = client.create(&content, passphrase, TTLS[f.ttl].1)?;
-    Ok(CreatedView {
-        recipient: created.recipient,
-        owner: created.owner,
-        expires: created.expires,
-        passphrase: passphrase.is_some(),
-        show_owner: false,
-    })
-}
-
-fn focused_block(title: &str, focused: bool) -> Block<'_> {
-    let b = Block::default().borders(Borders::ALL).title(title);
-    if focused {
-        b.border_style(Style::default().fg(accent()))
-    } else {
-        b
-    }
-}
-
-fn render_home(f: &mut Frame, area: Rect, selected: usize, hits: &mut Hits) {
-    for i in 0..HOME_ITEMS.len() {
-        let y = area.y + 1 + i as u16;
-        if y + 1 < area.bottom() {
-            hits.push((
-                Rect {
-                    x: area.x + 1,
-                    y,
-                    width: area.width.saturating_sub(2),
-                    height: 1,
-                },
-                Hit::Home(i),
-            ));
-        }
-    }
-    let items: Vec<ListItem> = HOME_ITEMS.iter().map(|s| ListItem::new(*s)).collect();
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" One-time secrets, encrypted on this machine "),
-        )
-        .highlight_style(Style::default().fg(accent()).add_modifier(Modifier::BOLD))
-        .highlight_symbol("› ");
-    let mut state = ListState::default().with_selected(Some(selected));
-    f.render_stateful_widget(list, area, &mut state);
-}
-
-/// Field scrolled so that the cursor stays visible; the terminal cursor is placed on it when
-/// focused.
-fn render_input(f: &mut Frame, area: Rect, input: &Input, title: &str, focused: bool) {
-    let (line, col) = input.line_col();
-    let (w, h) = (
-        area.width.saturating_sub(2) as usize,
-        area.height.saturating_sub(2) as usize,
-    );
-    let dy = line.saturating_sub(h.saturating_sub(1));
-    let dx = col.saturating_sub(w.saturating_sub(1));
-    // Only the visible window is handed to ratatui (slices of the text, no copies): offsets of any
-    // size work, unlike Paragraph::scroll with its u16 offsets.
-    // The cells actually skipped on the cursor's line (a wide grapheme at the edge goes whole).
-    let mut skipped = dx;
-    let visible: Vec<Line> = input
-        .text()
-        .split('\n')
-        .enumerate()
-        .skip(dy)
-        .take(h.max(1))
-        .map(|(n, l)| {
-            let (rest, cut) = skip_cols(l, dx);
-            if n == line {
-                skipped = cut;
-            }
-            Line::raw(rest)
-        })
-        .collect();
-    f.render_widget(
-        Paragraph::new(visible).block(focused_block(title, focused)),
-        area,
-    );
-    if focused && w > 0 && h > 0 {
-        f.set_cursor_position(Position {
-            x: area.x + 1 + col.saturating_sub(skipped) as u16,
-            y: area.y + 1 + (line - dy) as u16,
-        });
-    }
-}
-
-/// Screen lines of `text` at `width` cells: each line cut into pieces at grapheme boundaries
-/// (slices of the text, no copies).
-fn wrapped(text: &str, width: usize) -> impl Iterator<Item = &str> {
-    text.split('\n').flat_map(move |line| {
-        let mut pieces = Vec::new();
-        let (mut start, mut cells) = (0, 0);
-        for (i, g) in unicode_segmentation::UnicodeSegmentation::grapheme_indices(line, true) {
-            let gw = super::input::cells(g);
-            if cells + gw > width && i > start {
-                pieces.push(&line[start..i]);
-                start = i;
-                cells = 0;
-            }
-            cells += gw;
-        }
-        pieces.push(&line[start..]);
-        pieces
-    })
-}
-
-/// The part of a line after its first `cols` terminal cells, cut at grapheme boundaries (a wide
-/// grapheme straddling the edge is skipped whole), and the cells actually skipped.
-fn skip_cols(line: &str, cols: usize) -> (&str, usize) {
-    let mut seen = 0;
-    for (i, g) in unicode_segmentation::UnicodeSegmentation::grapheme_indices(line, true) {
-        if seen >= cols {
-            return (&line[i..], seen);
-        }
-        seen += super::input::cells(g);
-    }
-    ("", seen)
-}
-
-fn render_new(f: &mut Frame, area: Rect, form: &NewForm, hits: &mut Hits) {
-    let files_h = (form.files.len() as u16).min(6) + 2;
-    // Blank lines between the lifetime, the passphrase switch and the passphrase field.
-    let [text, path, files, _, ttl, _, toggle, _, field] = Layout::vertical([
-        Constraint::Min(5),
-        Constraint::Length(3),
-        Constraint::Length(if form.files.is_empty() { 0 } else { files_h }),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(if form.use_pass { 1 } else { 0 }),
-        Constraint::Length(if form.use_pass { 3 } else { 0 }),
-    ])
-    .areas(area);
-    hits.push((text, Hit::Focus(NewFocus::Text)));
-    hits.push((path, Hit::Focus(NewFocus::Path)));
-    render_input(
-        f,
-        text,
-        &form.text,
-        " Secret ",
-        form.focus == NewFocus::Text,
-    );
-    let path_title = format!(
-        " Add a file: path, then Enter ({}/{}) ",
-        form.files.len(),
-        format::MAX_FILES
-    );
-    render_input(
-        f,
-        path,
-        &form.path,
-        &path_title,
-        form.focus == NewFocus::Path,
-    );
-    if !form.files.is_empty() {
-        let total: u64 = form.files.iter().map(|p| p.size).sum();
-        let items: Vec<ListItem> = form
-            .files
-            .iter()
-            .map(|p| {
-                ListItem::new(format!(
-                    "{}  {}",
-                    p.name,
-                    crate::ops::human_size(p.size as usize)
-                ))
-            })
-            .collect();
-        let title = format!(
-            " Files, {} · Del removes ",
-            crate::ops::human_size(total as usize)
-        );
-        let list = List::new(items)
-            .block(focused_block(&title, form.focus == NewFocus::Files))
-            .highlight_symbol("› ");
-        let mut state = ListState::default().with_selected(Some(form.file_sel));
-        f.render_stateful_widget(list, files, &mut state);
-        // Rows as drawn: the list may be scrolled to keep the selected file visible.
-        let rows = files.height.saturating_sub(2) as usize;
-        for row in 0..rows.min(form.files.len().saturating_sub(state.offset())) {
-            hits.push((
-                Rect {
-                    x: files.x + 1,
-                    y: files.y + 1 + row as u16,
-                    width: files.width.saturating_sub(2),
-                    height: 1,
-                },
-                Hit::File(state.offset() + row),
-            ));
-        }
-    }
-    let prefix = " If nobody opens it, delete after: ";
-    let mut spans = vec![Span::raw(prefix)];
-    let mut x = ttl.x + prefix.len() as u16;
-    for (i, (label, _)) in TTLS.iter().enumerate() {
-        let style = if i == form.ttl {
-            Style::default().fg(accent()).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(muted())
-        };
-        let item = format!(" {label} ");
-        let w = item.len() as u16;
-        hits.push((
-            Rect {
-                x,
-                y: ttl.y,
-                width: w,
-                height: 1,
-            },
-            Hit::Ttl(i),
-        ));
-        x += w;
-        spans.push(Span::styled(item, style));
-    }
-    if form.focus == NewFocus::Ttl {
-        spans.push(Span::styled("  ←/→", Style::default().fg(accent())));
-    }
-    f.render_widget(Paragraph::new(Line::from(spans)), ttl);
-    let mark = if form.use_pass { "[x]" } else { "[ ]" };
-    let style = if form.focus == NewFocus::UsePass {
-        Style::default().fg(accent())
-    } else {
-        Style::default()
-    };
-    f.render_widget(
-        Paragraph::new(format!(" {mark} Protect with a passphrase (Space)")).style(style),
-        toggle,
-    );
-    hits.push((toggle, Hit::PassToggle));
-    if form.use_pass {
-        // The field, and the generator button to its right.
-        let label = " Generate  Ctrl+G ";
-        let [input, _, button] = Layout::horizontal([
-            Constraint::Min(10),
-            Constraint::Length(2),
-            Constraint::Length(label.len() as u16),
-        ])
-        .areas(field);
-        let title = if form.generated {
-            " Passphrase (generated): send it through a different channel "
-        } else {
-            " Passphrase: send it through a different channel "
-        };
-        render_input(f, input, &form.pass, title, form.focus == NewFocus::Pass);
-        hits.push((input, Hit::Focus(NewFocus::Pass)));
-        let button = Rect {
-            y: button.y + 1,
-            height: 1,
-            ..button
-        };
-        f.render_widget(
-            Paragraph::new(label).style(
-                Style::default()
-                    .fg(accent())
-                    .add_modifier(Modifier::REVERSED),
-            ),
-            button,
-        );
-        hits.push((button, Hit::Key(ctrl('g'))));
-    }
-}
-
-/// A link field; nothing is sent from it before the next screen.
-fn render_link_form(f: &mut Frame, area: Rect, i: &Input, title: &str) {
-    let [field, hint] = Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).areas(area);
-    render_input(f, field, i, title, true);
-    f.render_widget(
-        Paragraph::new("Nothing is sent until you confirm.").style(Style::default().fg(muted())),
-        hint,
-    );
-}
-
-fn render_reveal(f: &mut Frame, area: Rect, v: &RevealView) {
-    let [warn, pass] = Layout::vertical([
-        Constraint::Length(4),
-        Constraint::Length(if v.link.passphrase_hint { 3 } else { 0 }),
-    ])
-    .areas(area);
-    f.render_widget(
-        Paragraph::new(vec![
-            Line::styled(
-                "Someone shared a secret with you",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Line::styled(
-                "It will be destroyed on the server as soon as you reveal it. Make sure you can copy or save it now.",
-                Style::default().fg(Color::Yellow),
-            ),
-            Line::styled(
-                "Not expecting it? Don't open it, tell the sender.",
-                Style::default().fg(muted()),
-            ),
-        ])
-        .wrap(Wrap { trim: true }),
-        warn,
-    );
-    if v.link.passphrase_hint {
-        render_input(f, pass, &v.pass, " Passphrase ", true);
-    }
-}
-
-fn render_unlock(f: &mut Frame, area: Rect, v: &UnlockView) {
-    let [warn, pass, _] = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Length(3),
-        Constraint::Min(0),
-    ])
-    .areas(area);
-    f.render_widget(
-        Paragraph::new(vec![
-            Line::styled(
-                "Enter the passphrase",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Line::styled(
-                "The secret has been fetched and deleted from the server. Leaving destroys it.",
-                Style::default().fg(Color::Yellow),
-            ),
-        ])
-        .wrap(Wrap { trim: true }),
-        warn,
-    );
-    render_input(f, pass, &v.pass, " Passphrase ", true);
-}
-
-fn render_revealed(f: &mut Frame, area: Rect, v: &RevealedView) {
-    let files = v.files();
-    let files_h = if files.is_empty() {
-        0
-    } else {
-        (files.len() as u16).min(8) + 2
-    };
-    let [text, list, dir] = Layout::vertical([
-        Constraint::Min(if v.text().is_empty() { 0 } else { 3 }),
-        Constraint::Length(files_h),
-        Constraint::Length(if v.saving { 3 } else { 0 }),
-    ])
-    .areas(area);
-    if !v.text().is_empty() {
-        // Wrapped at the field width by graphemes (exact for tokens and keys) and scrolled by
-        // screen lines; the scroll stops at the last page.
-        let (w, h) = (
-            text.width.saturating_sub(2).max(1) as usize,
-            text.height.saturating_sub(2).max(1) as usize,
-        );
-        let total = wrapped(v.text(), w).count();
-        let max = total.saturating_sub(h);
-        v.max_scroll.set(max);
-        let lines: Vec<Line> = wrapped(v.text(), w)
-            .skip(v.scroll.min(max))
-            .take(h)
-            .map(Line::raw)
-            .collect();
-        f.render_widget(
-            Paragraph::new(lines).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Your secret "),
-            ),
-            text,
-        );
-    }
-    if !files.is_empty() {
-        let items: Vec<ListItem> = files
-            .iter()
-            .map(|(n, size)| {
-                ListItem::new(format!(
-                    "{}  {}",
-                    crate::api::printable(n),
-                    human_size(*size)
-                ))
-            })
-            .collect();
-        let title = match &v.saved {
-            Some(dir) => format!(" Files: saved to {dir} "),
-            None => " Files (s saves them into a new private directory) ".to_string(),
-        };
-        f.render_widget(
-            List::new(items).block(Block::default().borders(Borders::ALL).title(title)),
-            list,
-        );
-    }
-    if v.saving {
-        render_input(f, dir, &v.dir, " Save into a new directory ", true);
-    }
-}
-
-fn render_status(f: &mut Frame, area: Rect, v: &StatusView) {
-    let s = &v.status;
-    let state = match s.state.as_str() {
-        "stored" => "Waiting to be read",
-        "consumed" => "Read",
-        "revoked" => "Revoked",
-        other => other,
-    };
-    let row = |k: &'static str, val: String| {
-        Line::from(vec![
-            Span::styled(k, Style::default().fg(muted())),
-            Span::raw(val),
-        ])
-    };
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled("State             ", Style::default().fg(muted())),
-            Span::styled(state, Style::default().add_modifier(Modifier::BOLD)),
-        ]),
-        row("Created           ", s.created.clone()),
-        row("Deleted if unread ", s.expires.clone()),
-    ];
-    if let Some(at) = &s.consumed_at {
-        let by = s
-            .consumed_by
-            .as_deref()
-            .map(|b| format!(" by {b}"))
-            .unwrap_or_default();
-        lines.push(row("Read              ", format!("{at}{by}")));
-    }
-    f.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Secret status "),
-        ),
-        area,
-    );
-}
-
-fn render_created(f: &mut Frame, area: Rect, v: &CreatedView) {
-    let mut lines = vec![
-        Line::styled(
-            "Send this link to the recipient",
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Line::styled(
-            "It opens once, then the secret is destroyed. Anyone who opens it first can read it.",
-            Style::default().fg(muted()),
-        ),
-        Line::raw(""),
-        Line::styled(v.recipient.as_str(), Style::default().fg(accent())),
-        Line::raw(""),
-    ];
-    if v.passphrase {
-        lines.push(Line::styled(
-            "Send the passphrase separately, through a different channel.",
-            Style::default().fg(muted()),
-        ));
-    }
-    lines.push(Line::styled(
-        format!(
-            "Opens only once. If nobody opens it, it is deleted on {}.",
-            v.expires
-        ),
-        Style::default().fg(muted()),
-    ));
-    lines.push(Line::raw(""));
-    if v.show_owner {
-        lines.push(Line::styled(
-            "Only for you: track or revoke. Do not send this one.",
-            Style::default().fg(ok()),
-        ));
-        lines.push(Line::raw(v.owner.as_str()));
-    } else {
-        lines.push(Line::styled(
-            "Only for you: track or revoke (o to show)",
-            Style::default().fg(muted()),
-        ));
-    }
-    f.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Ready to share "),
-        ),
-        area,
-    );
+    Ok((
+        CreatedView {
+            recipient: created.recipient,
+            owner: created.owner,
+            expires: created.expires,
+            passphrase: passphrase.is_some(),
+            show_owner: false,
+            focus: 0,
+        },
+        limit,
+    ))
 }
 
 #[cfg(test)]
-pub mod tests {
-    use super::*;
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
-    use std::sync::{Arc, Mutex};
-
-    type Scheduled = Arc<Mutex<Vec<([u8; 32], Duration)>>>;
-
-    /// Clipboard in memory: what was copied and whether it is the system one.
-    #[derive(Clone, Default)]
-    pub struct MemClip {
-        pub value: Arc<Mutex<Option<String>>>,
-        /// Background removals asked for: (hash, delay).
-        pub scheduled: Scheduled,
-        pub terminal: bool,
-        /// The clipboard is temporarily unavailable.
-        pub down: Arc<Mutex<bool>>,
-    }
-
-    impl Clip for MemClip {
-        fn copy(&mut self, text: &str) -> Result<Via, String> {
-            *self.value.lock().unwrap() = Some(text.to_owned());
-            Ok(if self.terminal {
-                Via::Terminal
-            } else {
-                Via::System
-            })
-        }
-        fn read(&mut self) -> Result<Option<Zeroizing<String>>, Unavailable> {
-            if *self.down.lock().unwrap() {
-                return Err(Unavailable);
-            }
-            Ok(self.value.lock().unwrap().clone().map(Zeroizing::new))
-        }
-        fn clear(&mut self) -> Result<(), Unavailable> {
-            if *self.down.lock().unwrap() {
-                return Err(Unavailable);
-            }
-            *self.value.lock().unwrap() = None;
-            Ok(())
-        }
-        fn schedule_clear(&mut self, hash: [u8; 32], delay: Duration) {
-            self.scheduled.lock().unwrap().push((hash, delay));
-        }
-    }
-
-    fn key(c: KeyCode) -> KeyEvent {
-        KeyEvent::new(c, KeyModifiers::NONE)
-    }
-
-    pub fn screen_text(app: &App) -> String {
-        let mut t = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        t.draw(|f| app.render(f)).unwrap();
-        let buf = t.backend().buffer().clone();
-        buf.content.iter().map(|c| c.symbol()).collect()
-    }
-
-    #[test]
-    fn colors_fall_back_to_the_256_palette() {
-        assert_eq!(pick_for(true, (52, 139, 255), 33), Color::Rgb(52, 139, 255));
-        assert_eq!(pick_for(false, (52, 139, 255), 33), Color::Indexed(33));
-    }
-
-    #[test]
-    fn home_navigation_and_quit() {
-        let mut app = App::new(Box::new(MemClip::default()));
-        assert!(screen_text(&app).contains("New secret"));
-        app.key(key(KeyCode::Down));
-        app.key(key(KeyCode::Down));
-        app.key(key(KeyCode::Enter));
-        assert!(matches!(app.screen, Screen::StatusForm(_)));
-        app.key(key(KeyCode::Esc));
-        app.key(key(KeyCode::Up));
-        app.key(key(KeyCode::Enter));
-        assert!(app.quit, "Up from the first item wraps to Quit");
-        let mut app = App::new(Box::new(MemClip::default()));
-        app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
-        assert!(app.quit);
-    }
-
-    #[test]
-    fn copy_warns_once_then_copies_and_clears_secret_text_only() {
-        let clip = MemClip::default();
-        let mut app = App::new(Box::new(clip.clone()));
-        let t0 = Instant::now();
-        app.tick(t0);
-        app.copy("link", "The link", false);
-        assert_eq!(*clip.value.lock().unwrap(), None, "first press only warns");
-        app.copy("link", "The link", false);
-        assert_eq!(clip.value.lock().unwrap().as_deref(), Some("link"));
-        assert!(
-            clip.scheduled.lock().unwrap().is_empty(),
-            "links are not removed"
-        );
-        app.tick(t0 + CLEAR_AFTER * 2);
-        assert_eq!(
-            clip.value.lock().unwrap().as_deref(),
-            Some("link"),
-            "links stay"
-        );
-        // A secret text is removed after 60 s, even after leaving the screen; the removal is also
-        // scheduled on its own thread, so a blocking request cannot delay it.
-        app.copy("s3cret", "The secret", true);
-        assert_eq!(
-            *clip.scheduled.lock().unwrap(),
-            [(<[u8; 32]>::from(Sha256::digest(b"s3cret")), CLEAR_AFTER)]
-        );
-        app.screen = Screen::Home { selected: 0 };
-        app.tick(t0 + CLEAR_AFTER * 2 + Duration::from_secs(59));
-        assert_eq!(clip.value.lock().unwrap().as_deref(), Some("s3cret"));
-        app.tick(t0 + CLEAR_AFTER * 3 + Duration::from_secs(1));
-        assert_eq!(*clip.value.lock().unwrap(), None);
-        // Replaced by the user meanwhile: left alone.
-        app.copy("s3cret", "The secret", true);
-        *clip.value.lock().unwrap() = Some("user text".into());
-        app.tick(t0 + CLEAR_AFTER * 10);
-        assert_eq!(clip.value.lock().unwrap().as_deref(), Some("user text"));
-        // Quitting before the timer removes it at once.
-        app.copy("s3cret", "The secret", true);
-        app.on_quit();
-        assert_eq!(*clip.value.lock().unwrap(), None);
-        // Unavailable at removal time: retried, not forgotten.
-        let t1 = t0 + CLEAR_AFTER * 20;
-        app.tick(t1);
-        app.copy("s3cret", "The secret", true);
-        *clip.down.lock().unwrap() = true;
-        app.tick(t1 + CLEAR_AFTER);
-        assert_eq!(clip.value.lock().unwrap().as_deref(), Some("s3cret"));
-        *clip.down.lock().unwrap() = false;
-        app.tick(t1 + CLEAR_AFTER + CLEAR_RETRY);
-        assert_eq!(*clip.value.lock().unwrap(), None);
-        // An error or a panic in the loop drops the app: the secret is removed then too.
-        app.copy("s3cret", "The secret", true);
-        drop(app);
-        assert_eq!(*clip.value.lock().unwrap(), None);
-    }
-
-    #[test]
-    fn long_fields_scroll_to_the_cursor() {
-        let mut app = App::new(Box::new(MemClip::default()));
-        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        let Screen::New(f) = &mut app.screen else {
-            unreachable!()
-        };
-        f.focus = NewFocus::Path;
-        let long = format!("/very/long/{}/END-OF-PATH", "x".repeat(150));
-        app.paste(&long);
-        assert!(
-            screen_text(&app).contains("END-OF-PATH"),
-            "the tail is visible"
-        );
-        let Screen::New(f) = &mut app.screen else {
-            unreachable!()
-        };
-        f.focus = NewFocus::Text;
-        let lines: String = (0..40).map(|i| format!("line {i}\n")).collect();
-        app.paste(&format!("{lines}LAST-LINE"));
-        assert!(
-            screen_text(&app).contains("LAST-LINE"),
-            "the last line is visible"
-        );
-        // Beyond u16 offsets: a 70 KB single line still shows its end.
-        let Screen::New(f) = &mut app.screen else {
-            unreachable!()
-        };
-        f.text.clear();
-        app.paste(&format!("{}TAIL-OF-70K", "y".repeat(70_000)));
-        assert!(screen_text(&app).contains("TAIL-OF-70K"));
-        // Emoji ZWJ sequences: the window and the cursor agree, the tail stays visible.
-        let Screen::New(f) = &mut app.screen else {
-            unreachable!()
-        };
-        f.text.clear();
-        app.paste(&format!(
-            "{}TAIL-EMOJI",
-            "👨\u{200d}👩\u{200d}👧\u{200d}👦".repeat(100)
-        ));
-        assert!(screen_text(&app).contains("TAIL-EMOJI"));
-    }
-
-    /// Click at the centre of the first recorded area for `hit` in the last frame.
-    fn click(app: &mut App, want: Hit) {
-        screen_text(app);
-        let r = app
-            .hits
-            .borrow()
-            .iter()
-            .find(|(_, h)| *h == want)
-            .map(|(r, _)| *r)
-            .unwrap_or_else(|| panic!("{want:?} not on screen"));
-        app.mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: r.x + r.width / 2,
-            row: r.y,
-            modifiers: KeyModifiers::NONE,
-        });
-    }
-
-    #[test]
-    fn mouse_clicks_and_create_shortcuts() {
-        let mut app = App::new(Box::new(MemClip::default()));
-        click(&mut app, Hit::Home(0));
-        assert!(matches!(app.screen, Screen::New(_)));
-        app.paste("by mouse");
-        click(&mut app, Hit::Ttl(2));
-        click(&mut app, Hit::PassToggle);
-        let Screen::New(f) = &app.screen else {
-            unreachable!()
-        };
-        assert_eq!((f.ttl, f.use_pass), (2, true));
-        click(&mut app, Hit::Focus(NewFocus::Pass));
-        app.paste("pw");
-        click(&mut app, Hit::Focus(NewFocus::Text));
-        let Screen::New(f) = &app.screen else {
-            unreachable!()
-        };
-        assert_eq!(f.focus, NewFocus::Text);
-        // The Create button is drawn and clickable whatever the focus.
-        assert!(screen_text(&app).contains("Create one-time link  Ctrl+S"));
-        click(&mut app, Hit::Key(ctrl('s')));
-        assert!(matches!(app.pending, Some(Op::Create)));
-        // Keyboard: Ctrl+S and Shift+Enter from the text field; a plain Enter is a new line.
-        for k in [
-            ctrl('s'),
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::SUPER),
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT),
-        ] {
-            app.pending = None;
-            app.key(k);
-            assert!(matches!(app.pending, Some(Op::Create)), "{k:?}");
-        }
-        app.pending = None;
-        app.key(press(KeyCode::Enter));
-        assert!(app.pending.is_none());
-        let Screen::New(f) = &app.screen else {
-            unreachable!()
-        };
-        assert_eq!(f.text.text(), "by mouse\n");
-    }
-
-    #[test]
-    fn clicks_on_a_scrolled_file_list_pick_the_drawn_file() {
-        let mut app = App::new(Box::new(MemClip::default()));
-        app.key(press(KeyCode::Enter));
-        let Screen::New(f) = &mut app.screen else {
-            unreachable!()
-        };
-        for i in 0..7 {
-            f.files.push(PickedFile {
-                path: format!("/x/f{i}").into(),
-                name: format!("f{i}"),
-                size: 1,
-            });
-        }
-        f.file_sel = 6;
-        f.focus = NewFocus::Files;
-        // Six rows are drawn with the last file selected: the list starts at f1.
-        let s = screen_text(&app);
-        assert!(!s.contains("f0  ") && s.contains("f6  "));
-        let first = app.hits.borrow().iter().find_map(|(_, h)| match h {
-            Hit::File(i) => Some(*i),
-            _ => None,
-        });
-        assert_eq!(first, Some(1), "the top drawn row is f1");
-        click(&mut app, Hit::File(1));
-        let Screen::New(f) = &app.screen else {
-            unreachable!()
-        };
-        assert_eq!(f.file_sel, 1);
-    }
-
-    #[test]
-    fn buttons_wrap_instead_of_being_cut_at_80_columns() {
-        let mut app = App::new(Box::new(MemClip::default()));
-        app.screen = Screen::Created(CreatedView {
-            recipient: Zeroizing::new("https://x/s/1#k".into()),
-            owner: Zeroizing::new("https://x/o/1#t".into()),
-            expires: "e".into(),
-            passphrase: false,
-            show_owner: true,
-        });
-        let mut t = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        t.draw(|f| app.render(f)).unwrap();
-        let text: String = t
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|c| c.symbol())
-            .collect();
-        for label in [
-            "Copy link  c",
-            "Hide status link  o",
-            "Copy status link  y",
-            "New secret  n",
-            "Home  Esc",
-        ] {
-            assert!(text.contains(label), "{label} is drawn whole");
-        }
-    }
-
-    #[test]
-    fn mouse_wheel_scrolls_revealed_text() {
-        let mut app = App::new(Box::new(MemClip::default()));
-        let text: String = (0..200).map(|i| format!("row {i}\n")).collect();
-        app.reveal("0".repeat(64), Secret::Text(Zeroizing::new(text)));
-        screen_text(&app);
-        for _ in 0..10 {
-            app.mouse(MouseEvent {
-                kind: MouseEventKind::ScrollDown,
-                column: 5,
-                row: 5,
-                modifiers: KeyModifiers::NONE,
-            });
-        }
-        let Screen::Revealed(v) = &app.screen else {
-            unreachable!()
-        };
-        assert_eq!(v.scroll, 30);
-        // The bar offers the actions as buttons.
-        let s = screen_text(&app);
-        assert!(s.contains("Copy text  c") && s.contains("Save to a file  s"));
-    }
-
-    #[test]
-    fn long_revealed_line_wraps_and_scrolls_to_the_end() {
-        let mut app = App::new(Box::new(MemClip::default()));
-        let token = format!("{}END-OF-TOKEN", "t".repeat(5000));
-        app.reveal("0".repeat(64), Secret::Text(Zeroizing::new(token)));
-        assert!(!screen_text(&app).contains("END-OF-TOKEN"));
-        // Keys use the page size known from the last frame; scrolling past the end stops there.
-        for _ in 0..10 {
-            screen_text(&app);
-            app.key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
-        }
-        assert!(screen_text(&app).contains("END-OF-TOKEN"));
-        app.key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
-        assert!(
-            screen_text(&app).contains("tttt"),
-            "one page up from the end is still text"
-        );
-        // Over-scrolled state (e.g. the terminal grew): the first Up moves the view at once.
-        if let Screen::Revealed(v) = &mut app.screen {
-            v.scroll = 10_000;
-        }
-        let before = screen_text(&app);
-        app.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_ne!(screen_text(&app), before);
-    }
-
-    #[test]
-    fn halfwidth_marks_wrap_without_losing_text() {
-        let mut app = App::new(Box::new(MemClip::default()));
-        app.reveal(
-            "0".repeat(64),
-            Secret::Text(Zeroizing::new(format!("{}END", "ｶﾞ".repeat(98)))),
-        );
-        let mut seen = String::new();
-        for _ in 0..5 {
-            seen.push_str(&screen_text(&app));
-            app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        }
-        let shown = seen.matches("ｶﾞ").count();
-        assert!(shown >= 98, "{shown} of 98 shown");
-        assert!(seen.contains("END"));
-    }
-
-    #[test]
-    fn cursor_after_a_wide_grapheme_at_the_scroll_edge() {
-        let mut app = App::new(Box::new(MemClip::default()));
-        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        let Screen::New(f) = &mut app.screen else {
-            unreachable!()
-        };
-        f.focus = NewFocus::Path;
-        app.paste(&format!("{}AB", "界".repeat(50)));
-        app.key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
-        app.key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
-        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
-        t.draw(|f| app.render(f)).unwrap();
-        let pos = t.get_cursor_position().unwrap();
-        let buf = t.backend().buffer().clone();
-        assert_eq!(
-            buf[(pos.x, pos.y)].symbol(),
-            "A",
-            "the cursor is on A, where typing inserts"
-        );
-    }
-
-    #[test]
-    fn new_form_generate_files_and_validation() {
-        let mut app = App::new(Box::new(MemClip::default()));
-        app.key(key(KeyCode::Enter));
-        assert!(matches!(app.screen, Screen::New(_)));
-        // Create with nothing: a message, nothing queued.
-        let Screen::New(f) = &mut app.screen else {
-            unreachable!()
-        };
-        f.focus = NewFocus::Create;
-        app.key(key(KeyCode::Enter));
-        assert!(app.pending.is_none());
-        assert!(screen_text(&app).contains("Enter a secret or add a file."));
-        // Ctrl+G is for the passphrase: without it, nothing is generated (the secret is the user's).
-        app.key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
-        let Screen::New(f) = &mut app.screen else {
-            unreachable!()
-        };
-        assert_eq!(f.text.text(), "");
-        assert_eq!(f.pass.text(), "");
-        f.use_pass = true;
-        app.key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
-        let Screen::New(f) = &mut app.screen else {
-            unreachable!()
-        };
-        assert_eq!(f.pass.text().chars().count(), crate::password::LENGTH);
-        assert_eq!(f.text.text(), "");
-        assert!(f.generated);
-        let first = f.pass.text().to_owned();
-        // The button beside the field does the same.
-        click(&mut app, Hit::Key(ctrl('g')));
-        let Screen::New(f) = &mut app.screen else {
-            unreachable!()
-        };
-        assert_ne!(f.pass.text(), first);
-        assert!(screen_text(&app).contains("Generate  Ctrl+G"));
-        let Screen::New(f) = &mut app.screen else {
-            unreachable!()
-        };
-        f.use_pass = false;
-        f.pass.clear();
-        f.generated = false;
-        // A missing file is refused; a real one is listed.
-        f.focus = NewFocus::Path;
-        app.paste("/nonexistent/x");
-        app.key(key(KeyCode::Enter));
-        assert!(screen_text(&app).contains("No such file."));
-        let dir = std::env::temp_dir().join(format!("sdrop-tui-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("key.pem");
-        std::fs::write(&file, b"KEY").unwrap();
-        let Screen::New(f) = &mut app.screen else {
-            unreachable!()
-        };
-        f.path.clear();
-        app.paste(file.to_str().unwrap());
-        app.key(key(KeyCode::Enter));
-        let Screen::New(f) = &mut app.screen else {
-            unreachable!()
-        };
-        assert_eq!(f.files.len(), 1);
-        assert_eq!(f.files[0].name, "key.pem");
-        // Passphrase on but empty: refused.
-        f.use_pass = true;
-        f.focus = NewFocus::Create;
-        app.key(key(KeyCode::Enter));
-        assert!(app.pending.is_none());
-        let Screen::New(f) = &mut app.screen else {
-            unreachable!()
-        };
-        f.pass.set("pw");
-        app.key(key(KeyCode::Enter));
-        assert!(matches!(app.pending, Some(Op::Create)));
-    }
-}
+#[path = "app_tests.rs"]
+pub mod tests;

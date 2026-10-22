@@ -1657,7 +1657,7 @@ mod tui_create {
     }
 
     fn focus(app: &mut App, to: NewFocus) {
-        for _ in 0..10 {
+        for _ in 0..20 {
             if let Screen::New(f) = &app.screen
                 && f.focus == to
             {
@@ -1810,7 +1810,7 @@ mod tui_create {
 mod tui_open {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use sdrop::tui::app::{App, Screen};
+    use sdrop::tui::app::{Action, App, Hit, Screen};
     use sdrop::tui::clipboard::{Clip, Unavailable, Via};
     use std::sync::{Arc, Mutex};
     use zeroize::Zeroizing;
@@ -1848,6 +1848,31 @@ mod tui_open {
         app.key(key(KeyCode::Enter));
         app.perform(c);
         app
+    }
+
+    /// Draw a frame at `w`×`h` (records the click areas).
+    fn draw_at(app: &App, w: u16, h: u16) -> String {
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        t.draw(|f| app.render(f)).unwrap();
+        t.backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    fn draw(app: &App) -> String {
+        draw_at(app, 80, 24)
+    }
+
+    fn click(app: &mut App, column: u16, row: u16) {
+        app.mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
     }
 
     fn revealed_text(app: &App) -> String {
@@ -2001,9 +2026,11 @@ mod tui_open {
         app.key(key(KeyCode::Enter));
         app.perform(&mut c);
         assert_eq!(revealed_text(&app), text);
-        // Leaving with unsaved files needs a second press.
+        // Leaving with unsaved files asks first; Esc cancels.
         app.key(key(KeyCode::Esc));
-        assert!(matches!(app.screen, Screen::Revealed(_)));
+        assert!(app.dialog.is_some() && matches!(app.screen, Screen::Revealed(_)));
+        app.key(key(KeyCode::Esc));
+        assert!(app.dialog.is_none());
         let ro = std::env::temp_dir().join(format!("sdrop-tro-{}", rand_suffix()));
         std::fs::create_dir_all(&ro).unwrap();
         std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o500)).unwrap();
@@ -2015,9 +2042,11 @@ mod tui_open {
         assert!(app.message.as_ref().unwrap().1.contains("still here"));
         assert!(!ro.join("x").exists());
         let good = std::env::temp_dir().join(format!("sdrop-tok-{}", rand_suffix()));
-        // Ctrl+C with unsaved files: the first press only warns.
+        // Ctrl+C with unsaved files asks; Enter right away is "Stay".
         app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
-        assert!(!app.quit);
+        assert!(!app.quit && app.dialog.is_some());
+        app.key(key(KeyCode::Enter));
+        assert!(!app.quit && app.dialog.is_none());
         // The failed path stays in the open field: the user erases it with Backspace and types
         // another one.
         for _ in 0..ro.join("x").to_str().unwrap().chars().count() {
@@ -2034,7 +2063,7 @@ mod tui_open {
             );
         }
         assert_eq!(f.requests().len(), 1);
-        // Saved: leaving needs one press.
+        // Saved: leaving does not ask.
         app.key(key(KeyCode::Esc));
         assert!(matches!(app.screen, Screen::Home { .. }));
         std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -2078,14 +2107,30 @@ mod tui_open {
             _ => panic!("{:?}", app.message),
         };
         assert_eq!(state(&app), "stored");
+        // x asks; Enter on the fresh dialog is Cancel.
         app.key(key(KeyCode::Char('x')));
-        assert!(app.pending.is_none(), "first x only asks");
-        // Checking the status in between cancels the question: x asks again.
+        assert!(app.pending.is_none() && app.dialog.is_some(), "x only asks");
+        app.key(key(KeyCode::Enter));
+        assert!(app.pending.is_none() && app.dialog.is_none());
         app.key(key(KeyCode::Char('r')));
         app.perform(&mut c);
+        // Esc, and a click outside the dialog (on the Revoke button behind it), revoke nothing.
         app.key(key(KeyCode::Char('x')));
-        assert!(app.pending.is_none(), "after r, x asks again");
+        app.key(key(KeyCode::Esc));
+        assert!(app.pending.is_none() && app.dialog.is_none());
         app.key(key(KeyCode::Char('x')));
+        draw(&app);
+        let behind = app
+            .hits
+            .borrow()
+            .iter()
+            .find(|(_, h)| matches!(h, Hit::Act(Action::AskRevoke, _)))
+            .map(|(r, _)| *r)
+            .unwrap();
+        click(&mut app, behind.x, behind.y);
+        assert!(app.pending.is_none() && app.dialog.is_some());
+        app.key(key(KeyCode::Right));
+        app.key(key(KeyCode::Enter));
         app.perform(&mut c);
         assert_eq!(state(&app), "revoked");
         assert!(*revoked.lock().unwrap());
@@ -2099,5 +2144,76 @@ mod tui_open {
                     .contains(&("authorization".into(), format!("Bearer {token}")))
             );
         }
+    }
+    /// After consume the envelope lives only in the passphrase screen: Discard asks, Enter right
+    /// away, Esc and a click outside keep it; the window shrinking below 80×24 keeps it too. The
+    /// right passphrase then decrypts it with no second consume.
+    #[test]
+    fn passphrase_screen_survives_dialog_and_small_window() {
+        let v = vector("passphrase-ascii");
+        let f = serving_with_limit(hex(v["envelope_hex"].as_str().unwrap()), 262144);
+        let mut c = client(&f);
+        let link = format!("{}/s/{ID}#{}", f.origin, v["k_url"].as_str().unwrap());
+        let mut app = opened(&link, &mut c, MemClip::default());
+        app.key(key(KeyCode::Enter));
+        app.perform(&mut c);
+        assert!(matches!(app.screen, Screen::Unlock(_)));
+        app.key(key(KeyCode::Esc));
+        assert!(draw(&app).contains("Discard the downloaded secret?"));
+        app.key(key(KeyCode::Enter));
+        assert!(app.dialog.is_none() && matches!(app.screen, Screen::Unlock(_)));
+        app.key(key(KeyCode::Esc));
+        app.key(key(KeyCode::Esc));
+        app.key(key(KeyCode::Esc));
+        draw(&app);
+        click(&mut app, 0, 0);
+        assert!(app.dialog.is_some() && matches!(app.screen, Screen::Unlock(_)));
+        app.key(key(KeyCode::Esc));
+        app.paste("typed so far");
+        draw_at(&app, 80, 24);
+        assert!(draw_at(&app, 79, 23).contains("Enlarge the window"));
+        app.key(key(KeyCode::Esc));
+        app.paste("ignored while small");
+        assert!(draw_at(&app, 120, 35).contains("typed so far"));
+        let Screen::Unlock(u) = &mut app.screen else {
+            panic!("{:?}", app.message)
+        };
+        u.pass.clear();
+        app.paste(v["passphrase"].as_str().unwrap());
+        app.key(key(KeyCode::Enter));
+        app.perform(&mut c);
+        assert_eq!(revealed_text(&app), v["text"].as_str().unwrap());
+        assert_eq!(f.requests().len(), 1, "one consume");
+    }
+
+    /// Received files survive 80×24 → 79×23 → 120×35 and are saved whole afterwards.
+    #[test]
+    fn received_files_survive_a_small_window_and_save() {
+        let (k, env, text, datas) = bundle_vector();
+        let f = serving_with_limit(env, 262144);
+        let mut c = client(&f);
+        let link = format!("{}/s/{ID}#{k}", f.origin);
+        let mut app = opened(&link, &mut c, MemClip::default());
+        app.key(key(KeyCode::Enter));
+        app.perform(&mut c);
+        draw_at(&app, 80, 24);
+        draw_at(&app, 79, 23);
+        app.key(key(KeyCode::Esc));
+        app.key(key(KeyCode::Enter));
+        assert!(app.dialog.is_none() && matches!(app.screen, Screen::Revealed(_)));
+        draw_at(&app, 120, 35);
+        let dir = std::env::temp_dir().join(format!("sdrop-tsz-{}", rand_suffix()));
+        app.key(key(KeyCode::Char('s')));
+        app.paste(dir.to_str().unwrap());
+        app.key(key(KeyCode::Enter));
+        app.perform(&mut c);
+        assert_eq!(std::fs::read_to_string(dir.join("text")).unwrap(), text);
+        for (i, d) in datas.iter().enumerate() {
+            assert_eq!(
+                &std::fs::read(dir.join(format!("file-{}", i + 1))).unwrap(),
+                d
+            );
+        }
+        assert_eq!(f.requests().len(), 1, "one consume");
     }
 }

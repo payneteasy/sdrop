@@ -4,6 +4,9 @@ pub mod app;
 pub mod clipboard;
 pub mod input;
 pub mod term;
+pub mod theme;
+pub mod view;
+pub mod widgets;
 
 use crate::api::CliError;
 use app::App;
@@ -32,6 +35,12 @@ pub fn run() -> Result<(), CliError> {
         }
         if app.pending.is_some() {
             app.perform(&mut client);
+            continue;
+        }
+        if app.wants_limit {
+            // Shown next to the size of the secret; without it the form still works.
+            app.wants_limit = false;
+            app.limit = client.limit().ok();
             continue;
         }
         app.tick(std::time::Instant::now());

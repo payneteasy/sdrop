@@ -63,12 +63,24 @@ sdrop revoke 'https://secrets.example.com/o/…#…'
 
 `sdrop` without arguments on a terminal (or `sdrop tui`) opens a full-screen interface:
 
-- **New secret**: text (Ctrl+G generates a password), files by path (up to 20),
-  lifetime, passphrase; **Ctrl+S** creates the link from any field (Shift/Cmd/Alt+Enter too, in
-  terminals that report the modifier: kitty, WezTerm, Ghostty, Alacritty, iTerm2 with CSI u).
+- **New secret**: text, files by path (up to 20), lifetime, passphrase (**Ctrl+G** generates
+  one when the passphrase is on); the size is shown against the service limit. **Ctrl+S** creates
+  the link from any field (Shift/Cmd/Alt+Enter too, in terminals that report the modifier: kitty,
+  WezTerm, Ghostty, Alacritty, iTerm2 with CSI u).
+- **Link ready**: the recipient link with **c** to copy; your private sender link (track or
+  revoke) stays hidden until **o**, **y** copies it.
 - **Open a link**: nothing is sent until you confirm; the text is shown, files are saved into a
   new private directory; a passphrase can be retried without fetching again.
-- **Check status**: read or not, revoke (asks twice).
+- **Check status**: waiting to be opened, opened or revoked (times in UTC); revoke.
+- **Keys**: Tab / Shift+Tab move the focus, Enter or Space presses the focused button, the letter
+  in parentheses presses it from anywhere on the screen, Esc goes back. The focus is shown as
+  `> … <` and the chosen option as `(*)`, so the screen reads without color too.
+- **Confirmations**: revoking, leaving received files unsaved and discarding a downloaded secret
+  that still needs its passphrase ask first; the safe choice is focused, Esc cancels.
+- **Window**: at least 80×24; a smaller window shows only a note, nothing typed or received is
+  lost.
+- **Colors**: the brand accents in 24-bit color, else the 256-color palette (Terminal.app);
+  `NO_COLOR` turns them off.
 - **Mouse**: click fields, options and buttons; the wheel scrolls. While the mouse is captured,
   select text in the terminal with Option (macOS) or Shift (Linux, Windows) held.
 - **Clipboard**: the system clipboard on this machine; over SSH, the terminal's OSC 52 (the

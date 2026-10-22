@@ -355,6 +355,36 @@ fn decode_json_literal(lit: &str) -> Result<Zeroizing<String>, FormatError> {
     Ok(out)
 }
 
+/// Bytes the record of this text and these files (name, size) takes before padding, as
+/// `encode_plaintext` writes it (FORMAT.md 3, 4): to show the size against the service limit
+/// before reading the files.
+pub fn plaintext_len(text: &str, files: &[(&str, usize)]) -> usize {
+    let digits = |n: usize| n.to_string().len();
+    let data: usize = files.iter().map(|(_, z)| z).sum();
+    let header = match files {
+        [] => TEXT_PREFIX.len() + json_string_len(text) + 1,
+        [(name, size)] if text.is_empty() => {
+            FILE_PREFIX.len() + json_string_len(name) + SIZE_KEY.len() + digits(*size) + 1
+        }
+        _ => {
+            let list: usize = files
+                .iter()
+                .map(|(n, z)| {
+                    r#"{"name":"#.len() + json_string_len(n) + SIZE_KEY.len() + digits(*z) + 1
+                })
+                .sum();
+            BUNDLE_PREFIX.len()
+                + json_string_len(text)
+                + FILES_KEY.len()
+                + 1
+                + list
+                + (files.len() - 1)
+                + 2
+        }
+    };
+    4 + header + data
+}
+
 /// Canonical bundle header (FORMAT.md 4), in a preallocated wiped buffer.
 fn bundle_header(text: &str, files: &[(&str, usize)]) -> Result<Zeroizing<String>, FormatError> {
     let list: Vec<String> = files

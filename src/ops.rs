@@ -17,6 +17,8 @@ pub struct Client {
     creds_read: bool,
     /// May run the interactive `cloudflared access login` (CLI); the TUI must not.
     interactive_login: bool,
+    /// The service limit once read: one request per session.
+    limit: Option<usize>,
 }
 
 /// Links of a created secret.
@@ -96,6 +98,7 @@ impl Client {
             creds: None,
             creds_read: false,
             interactive_login,
+            limit: None,
         }
     }
 
@@ -141,8 +144,11 @@ impl Client {
         }
     }
 
-    /// Service limit (`GET /api/limits`): one of the format buckets.
+    /// Service limit (`GET /api/limits`): one of the format buckets; read once.
     pub fn limit(&mut self) -> Result<usize, CliError> {
+        if let Some(n) = self.limit {
+            return Ok(n);
+        }
         let r = self.call("GET", "/api/limits", &[], None)?;
         if r.status != 200 {
             return Err(http_error("reading the service limit failed", r.status));
@@ -153,7 +159,10 @@ impl Client {
             .and_then(Value::as_u64)
             .map(|n| n as usize)
         {
-            Some(n) if format::BUCKETS.contains(&n) => Ok(n),
+            Some(n) if format::BUCKETS.contains(&n) => {
+                self.limit = Some(n);
+                Ok(n)
+            }
             _ => err("the server returned an unexpected answer"),
         }
     }
