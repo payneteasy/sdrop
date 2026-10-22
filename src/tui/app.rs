@@ -1516,15 +1516,23 @@ fn add_file(f: &mut NewForm) -> Result<(), String> {
 
 /// `~/` expanded to the home directory, in a wiped buffer reserved up front.
 fn expand_home(p: &str) -> Zeroizing<String> {
-    let home = std::env::var("HOME").ok();
-    let (home, rest) = match (p.strip_prefix("~/"), home.as_deref()) {
-        (Some(rest), Some(home)) => (home.trim_end_matches('/'), rest),
-        _ => ("", p),
+    expand_home_with(p, std::env::var("HOME").ok().as_deref())
+}
+
+fn expand_home_with(p: &str, home: Option<&str>) -> Zeroizing<String> {
+    let (home, rest) = match (p.strip_prefix("~/"), home) {
+        (Some(rest), Some(home)) => (Some(home), rest),
+        _ => (None, p),
     };
-    let mut out = Zeroizing::new(String::with_capacity(home.len() + 1 + rest.len()));
-    if !home.is_empty() {
+    let mut out = Zeroizing::new(String::with_capacity(
+        home.map_or(0, |h| h.len() + 1) + rest.len(),
+    ));
+    if let Some(home) = home {
+        // `HOME=/` stays the root: `~/key.pem` is `/key.pem`, never a relative path.
         out.push_str(home);
-        out.push('/');
+        if !home.ends_with('/') {
+            out.push('/');
+        }
     }
     out.push_str(rest);
     out

@@ -723,6 +723,16 @@ fn received_names_are_shown_safely() {
 }
 
 #[test]
+fn home_is_expanded_keeping_the_root() {
+    let e = |p, h| expand_home_with(p, h).as_str().to_owned();
+    assert_eq!(e("~/key.pem", Some("/")), "/key.pem");
+    assert_eq!(e("~/key.pem", Some("/home/u")), "/home/u/key.pem");
+    assert_eq!(e("~/key.pem", Some("/home/u/")), "/home/u/key.pem");
+    assert_eq!(e("~/key.pem", None), "~/key.pem");
+    assert_eq!(e("/abs/x", Some("/home/u")), "/abs/x");
+}
+
+#[test]
 fn text_only_secret_leaves_without_asking() {
     let mut app = App::new(Box::new(MemClip::default()));
     app.reveal("0".repeat(64), Secret::Text(Zeroizing::new("t".into())));

@@ -153,8 +153,9 @@ pub struct PutArgs<'a> {
 
 /// File for `put --file` and the TUI: bytes and the sanitized name.
 pub fn read_file_secret(p: &Path) -> Result<(Zeroizing<String>, Zeroizing<Vec<u8>>), CliError> {
-    let shown = api::printable(&p.display().to_string());
-    let cannot = || CliError::Msg(format!("cannot read {shown}"));
+    // The path holds the name, part of the secret: shown (copied) only in an error.
+    let shown = || api::printable(&p.display().to_string());
+    let cannot = || CliError::Msg(format!("cannot read {}", shown()));
     let file = std::fs::File::open(p).map_err(|_| cannot())?;
     // The buffer holds the file as its size says (at most the limit, plus one byte to see more):
     // reading stops there, so it never reallocates and leaves no copies of the contents.
@@ -167,7 +168,7 @@ pub fn read_file_secret(p: &Path) -> Result<(Zeroizing<String>, Zeroizing<Vec<u8
         return Err(FormatError::TooLarge.into());
     }
     if buf.len() as u64 == room {
-        return err(format!("{shown} changed while it was read"));
+        return err(format!("{} changed while it was read", shown()));
     }
     let raw = p.file_name().map(|n| n.to_string_lossy());
     let name = format::sanitize_file_name(raw.as_deref().unwrap_or(""));

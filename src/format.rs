@@ -83,7 +83,12 @@ pub fn encode_base64url(bytes: &[u8]) -> String {
 /// A key or token in base64url (43 characters), appended to `out`: the caller reserves the room,
 /// so nothing is reallocated and no copy stays behind.
 pub fn push_key(out: &mut String, key: &[u8; KEY_LEN]) {
-    URL_SAFE_NO_PAD.encode_string(key, out);
+    // Encoded straight into a wiped array (`encode_string` goes through an unwiped stack buffer).
+    let mut enc = Zeroizing::new([0u8; 44]);
+    let n = URL_SAFE_NO_PAD
+        .encode_slice(key, &mut enc[..])
+        .expect("43 characters fit");
+    out.push_str(std::str::from_utf8(&enc[..n]).expect("base64 is ASCII"));
 }
 
 /// Strict decoding into exactly 32 bytes: base64url alphabet only, no padding,
