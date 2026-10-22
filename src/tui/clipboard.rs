@@ -13,11 +13,16 @@ pub enum Via {
     Terminal,
 }
 
+/// The system clipboard cannot be used right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unavailable;
+
 pub trait Clip {
     fn copy(&mut self, text: &str) -> Result<Via, String>;
-    /// Current system clipboard text (None if unavailable or not text).
-    fn read(&mut self) -> Option<Zeroizing<String>>;
-    fn clear(&mut self);
+    /// Current system clipboard text: `Ok(None)` if it holds no text, `Err` if the clipboard is
+    /// unavailable right now (then a pending removal is retried, not dropped).
+    fn read(&mut self) -> Result<Option<Zeroizing<String>>, Unavailable>;
+    fn clear(&mut self) -> Result<(), Unavailable>;
 }
 
 pub struct SystemClip {
@@ -56,7 +61,7 @@ impl Clip for SystemClip {
     fn copy(&mut self, text: &str) -> Result<Via, String> {
         if !self.ssh
             && let Some(b) = self.board.as_mut()
-            && b.set_text(text.to_owned()).is_ok()
+            && b.set_text(text).is_ok()
         {
             return Ok(Via::System);
         }
@@ -68,14 +73,21 @@ impl Clip for SystemClip {
         Ok(Via::Terminal)
     }
 
-    fn read(&mut self) -> Option<Zeroizing<String>> {
-        self.board.as_mut()?.get_text().ok().map(Zeroizing::new)
+    fn read(&mut self) -> Result<Option<Zeroizing<String>>, Unavailable> {
+        let b = self.board.as_mut().ok_or(Unavailable)?;
+        match b.get_text() {
+            Ok(t) => Ok(Some(Zeroizing::new(t))),
+            Err(arboard::Error::ContentNotAvailable) => Ok(None),
+            Err(_) => Err(Unavailable),
+        }
     }
 
-    fn clear(&mut self) {
-        if let Some(b) = self.board.as_mut() {
-            let _ = b.clear();
-        }
+    fn clear(&mut self) -> Result<(), Unavailable> {
+        self.board
+            .as_mut()
+            .ok_or(Unavailable)?
+            .clear()
+            .map_err(|_| Unavailable)
     }
 }
 

@@ -2,7 +2,7 @@
 //! disk work is queued as an operation and run between frames (`perform`), so tests drive the app
 //! without a terminal (ratatui `TestBackend`) and with a local test server.
 
-use super::clipboard::{Clip, Via};
+use super::clipboard::{Clip, Unavailable, Via};
 use super::input::Input;
 use crate::api::CliError;
 use crate::format;
@@ -27,6 +27,8 @@ pub const HOME_ITEMS: [&str; 4] = ["New secret", "Open a link", "Check status", 
 pub const TTLS: [(&str, u32); 3] = [("1 hour", 3600), ("24 hours", 86400), ("7 days", 604800)];
 /// How long a copied secret text stays in the system clipboard.
 pub const CLEAR_AFTER: Duration = Duration::from_secs(60);
+/// Retry interval when the clipboard is unavailable at removal time.
+pub const CLEAR_RETRY: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NewFocus {
@@ -186,31 +188,38 @@ impl App {
         }
     }
 
-    /// Time passes: remove a copied secret text from the clipboard when due, if unchanged.
+    /// Remove the copied secret text if the clipboard still holds it. Done (true) when removed
+    /// or replaced by something else; false when the clipboard was unavailable (try again).
+    fn try_clear(&mut self, hash: [u8; 32]) -> bool {
+        match self.clip.read() {
+            Ok(Some(cur)) if <[u8; 32]>::from(Sha256::digest(cur.as_bytes())) == hash => {
+                self.clip.clear().is_ok()
+            }
+            Ok(_) => true,
+            Err(Unavailable) => false,
+        }
+    }
+
+    /// Time passes: remove a copied secret text from the clipboard when due, if unchanged; if the
+    /// clipboard is unavailable, retry later instead of forgetting it.
     pub fn tick(&mut self, now: Instant) {
         self.now = now;
         if let Some(c) = &self.clear
             && now >= c.at
         {
             let hash = c.hash;
-            self.clear = None;
-            if let Some(cur) = self.clip.read()
-                && <[u8; 32]>::from(Sha256::digest(cur.as_bytes())) == hash
-            {
-                self.clip.clear();
+            if self.try_clear(hash) {
+                self.clear = None;
+            } else if let Some(c) = &mut self.clear {
+                c.at = now + CLEAR_RETRY;
             }
         }
     }
 
-    /// Before quitting: a copied secret text still waiting to be removed is removed now.
+    /// Leaving (quit, error or panic): a copied secret text still waiting is removed now.
     pub fn on_quit(&mut self) {
         if let Some(c) = self.clear.take() {
-            let hash = c.hash;
-            if let Some(cur) = self.clip.read()
-                && <[u8; 32]>::from(Sha256::digest(cur.as_bytes())) == hash
-            {
-                self.clip.clear();
-            }
+            self.try_clear(c.hash);
         }
     }
 
@@ -438,6 +447,13 @@ impl App {
     }
 }
 
+impl Drop for App {
+    /// Also on an error or a panic in the event loop: the clipboard is not left holding a secret.
+    fn drop(&mut self) {
+        self.on_quit();
+    }
+}
+
 /// Common editing keys for a field; true if the text changed.
 fn edit(i: &mut Input, k: KeyEvent) -> bool {
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
@@ -571,19 +587,27 @@ fn render_home(f: &mut Frame, area: Rect, selected: usize) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
-/// Field with the terminal cursor placed at the input's cursor when focused.
+/// Field scrolled so that the cursor stays visible; the terminal cursor is placed on it when
+/// focused.
 fn render_input(f: &mut Frame, area: Rect, input: &Input, title: &str, focused: bool) {
+    let (line, col) = input.line_col();
+    let (w, h) = (
+        area.width.saturating_sub(2) as usize,
+        area.height.saturating_sub(2) as usize,
+    );
+    let dy = line.saturating_sub(h.saturating_sub(1));
+    let dx = col.saturating_sub(w.saturating_sub(1));
     f.render_widget(
-        Paragraph::new(input.text()).block(focused_block(title, focused)),
+        Paragraph::new(input.text())
+            .scroll((dy as u16, dx as u16))
+            .block(focused_block(title, focused)),
         area,
     );
-    if focused {
-        let (line, col) = input.line_col();
-        let x = area.x + 1 + col as u16;
-        let y = area.y + 1 + line as u16;
-        if x < area.right().saturating_sub(1) && y < area.bottom().saturating_sub(1) {
-            f.set_cursor_position(Position { x, y });
-        }
+    if focused && w > 0 && h > 0 {
+        f.set_cursor_position(Position {
+            x: area.x + 1 + (col - dx) as u16,
+            y: area.y + 1 + (line - dy) as u16,
+        });
     }
 }
 
@@ -748,6 +772,8 @@ pub mod tests {
     pub struct MemClip {
         pub value: Arc<Mutex<Option<String>>>,
         pub terminal: bool,
+        /// The clipboard is temporarily unavailable.
+        pub down: Arc<Mutex<bool>>,
     }
 
     impl Clip for MemClip {
@@ -759,11 +785,18 @@ pub mod tests {
                 Via::System
             })
         }
-        fn read(&mut self) -> Option<Zeroizing<String>> {
-            self.value.lock().unwrap().clone().map(Zeroizing::new)
+        fn read(&mut self) -> Result<Option<Zeroizing<String>>, Unavailable> {
+            if *self.down.lock().unwrap() {
+                return Err(Unavailable);
+            }
+            Ok(self.value.lock().unwrap().clone().map(Zeroizing::new))
         }
-        fn clear(&mut self) {
+        fn clear(&mut self) -> Result<(), Unavailable> {
+            if *self.down.lock().unwrap() {
+                return Err(Unavailable);
+            }
             *self.value.lock().unwrap() = None;
+            Ok(())
         }
     }
 
@@ -827,6 +860,46 @@ pub mod tests {
         app.copy("s3cret", "The secret", true);
         app.on_quit();
         assert_eq!(*clip.value.lock().unwrap(), None);
+        // Unavailable at removal time: retried, not forgotten.
+        let t1 = t0 + CLEAR_AFTER * 20;
+        app.tick(t1);
+        app.copy("s3cret", "The secret", true);
+        *clip.down.lock().unwrap() = true;
+        app.tick(t1 + CLEAR_AFTER);
+        assert_eq!(clip.value.lock().unwrap().as_deref(), Some("s3cret"));
+        *clip.down.lock().unwrap() = false;
+        app.tick(t1 + CLEAR_AFTER + CLEAR_RETRY);
+        assert_eq!(*clip.value.lock().unwrap(), None);
+        // An error or a panic in the loop drops the app: the secret is removed then too.
+        app.copy("s3cret", "The secret", true);
+        drop(app);
+        assert_eq!(*clip.value.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn long_fields_scroll_to_the_cursor() {
+        let mut app = App::new(Box::new(MemClip::default()));
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let Screen::New(f) = &mut app.screen else {
+            unreachable!()
+        };
+        f.focus = NewFocus::Path;
+        let long = format!("/very/long/{}/END-OF-PATH", "x".repeat(150));
+        app.paste(&long);
+        assert!(
+            screen_text(&app).contains("END-OF-PATH"),
+            "the tail is visible"
+        );
+        let Screen::New(f) = &mut app.screen else {
+            unreachable!()
+        };
+        f.focus = NewFocus::Text;
+        let lines: String = (0..40).map(|i| format!("line {i}\n")).collect();
+        app.paste(&format!("{lines}LAST-LINE"));
+        assert!(
+            screen_text(&app).contains("LAST-LINE"),
+            "the last line is visible"
+        );
     }
 
     #[test]

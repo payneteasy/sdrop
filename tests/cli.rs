@@ -1626,7 +1626,7 @@ mod tui_create {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use sdrop::tui::app::{App, NewFocus, Screen};
-    use sdrop::tui::clipboard::{Clip, Via};
+    use sdrop::tui::clipboard::{Clip, Unavailable, Via};
     use zeroize::Zeroizing;
 
     struct NoClip;
@@ -1634,10 +1634,12 @@ mod tui_create {
         fn copy(&mut self, _: &str) -> Result<Via, String> {
             Ok(Via::System)
         }
-        fn read(&mut self) -> Option<Zeroizing<String>> {
-            None
+        fn read(&mut self) -> Result<Option<Zeroizing<String>>, Unavailable> {
+            Ok(None)
         }
-        fn clear(&mut self) {}
+        fn clear(&mut self) -> Result<(), Unavailable> {
+            Ok(())
+        }
     }
 
     fn key(c: KeyCode) -> KeyEvent {
