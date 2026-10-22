@@ -1804,3 +1804,257 @@ mod tui_create {
         );
     }
 }
+
+// ---------- Interactive mode: Open a link, Check status ----------
+
+mod tui_open {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use sdrop::tui::app::{App, Screen};
+    use sdrop::tui::clipboard::{Clip, Unavailable, Via};
+    use std::sync::{Arc, Mutex};
+    use zeroize::Zeroizing;
+
+    #[derive(Clone, Default)]
+    struct MemClip(Arc<Mutex<Option<String>>>);
+    impl Clip for MemClip {
+        fn copy(&mut self, t: &str) -> Result<Via, String> {
+            *self.0.lock().unwrap() = Some(t.to_owned());
+            Ok(Via::System)
+        }
+        fn read(&mut self) -> Result<Option<Zeroizing<String>>, Unavailable> {
+            Ok(self.0.lock().unwrap().clone().map(Zeroizing::new))
+        }
+        fn clear(&mut self) -> Result<(), Unavailable> {
+            *self.0.lock().unwrap() = None;
+            Ok(())
+        }
+    }
+
+    fn key(c: KeyCode) -> KeyEvent {
+        KeyEvent::new(c, KeyModifiers::NONE)
+    }
+
+    fn client(f: &Fake) -> sdrop::ops::Client {
+        sdrop::ops::Client::with_origin(sdrop::api::Origin::parse(&f.origin).unwrap(), false)
+    }
+
+    /// App on the "Open a link" screen with the link pasted and checked.
+    fn opened(link: &str, c: &mut sdrop::ops::Client, clip: MemClip) -> App {
+        let mut app = App::new(Box::new(clip));
+        app.key(key(KeyCode::Down));
+        app.key(key(KeyCode::Enter));
+        app.paste(link);
+        app.key(key(KeyCode::Enter));
+        app.perform(c);
+        app
+    }
+
+    fn revealed_text(app: &App) -> String {
+        match &app.screen {
+            Screen::Revealed(v) => v.text().to_owned(),
+            _ => panic!("not revealed: {:?}", app.message),
+        }
+    }
+
+    #[test]
+    fn broken_or_foreign_link_sends_nothing() {
+        let f = never_called();
+        let mut c = client(&f);
+        for link in [
+            "garbage".to_string(),
+            format!("{}/s/{ID}#short", f.origin),
+            format!("https://evil.example/s/{ID}#{}", "A".repeat(43)),
+        ] {
+            let app = opened(&link, &mut c, MemClip::default());
+            assert!(matches!(app.screen, Screen::Open(_)), "{link}");
+            assert!(app.message.as_ref().unwrap().0, "{link}: an error is shown");
+        }
+        assert_eq!(f.requests().len(), 0);
+    }
+
+    #[test]
+    fn reveal_only_after_confirmation_exactly_one_consume() {
+        let v = vector("plain-ascii");
+        let f = serving_with_limit(hex(v["envelope_hex"].as_str().unwrap()), 262144);
+        let mut c = client(&f);
+        let link = format!("{}/s/{ID}#{}", f.origin, v["k_url"].as_str().unwrap());
+        let mut app = opened(&link, &mut c, MemClip::default());
+        assert!(matches!(app.screen, Screen::Reveal(_)));
+        assert_eq!(f.requests().len(), 0, "nothing before Reveal");
+        app.key(key(KeyCode::Enter));
+        app.perform(&mut c);
+        assert_eq!(revealed_text(&app), v["text"].as_str().unwrap());
+        assert_eq!(f.requests().len(), 1);
+        assert!(f.requests()[0].path.ends_with("/consume"));
+    }
+
+    #[test]
+    fn passphrase_by_hint_before_consume() {
+        let v = vector("passphrase-ascii");
+        let f = serving_with_limit(hex(v["envelope_hex"].as_str().unwrap()), 262144);
+        let mut c = client(&f);
+        let link = format!("{}/s/{ID}#{}~p", f.origin, v["k_url"].as_str().unwrap());
+        let mut app = opened(&link, &mut c, MemClip::default());
+        app.key(key(KeyCode::Enter));
+        assert!(app.pending.is_none(), "empty passphrase: nothing queued");
+        app.paste(v["passphrase"].as_str().unwrap());
+        app.key(key(KeyCode::Enter));
+        app.perform(&mut c);
+        assert_eq!(revealed_text(&app), v["text"].as_str().unwrap());
+        assert_eq!(f.requests().len(), 1);
+    }
+
+    #[test]
+    fn passphrase_after_consume_wrong_empty_right_one_consume() {
+        let v = vector("passphrase-ascii");
+        let f = serving_with_limit(hex(v["envelope_hex"].as_str().unwrap()), 262144);
+        let mut c = client(&f);
+        // The ~p suffix was removed: the envelope flag asks for the passphrase after consume.
+        let link = format!("{}/s/{ID}#{}", f.origin, v["k_url"].as_str().unwrap());
+        let mut app = opened(&link, &mut c, MemClip::default());
+        app.key(key(KeyCode::Enter));
+        app.perform(&mut c);
+        assert!(matches!(app.screen, Screen::Unlock(_)), "{:?}", app.message);
+        app.paste("wrong");
+        app.key(key(KeyCode::Enter));
+        app.perform(&mut c);
+        assert!(matches!(app.screen, Screen::Unlock(_)));
+        assert!(app.message.as_ref().unwrap().1.contains("Wrong passphrase"));
+        app.key(key(KeyCode::Enter));
+        assert!(
+            app.pending.is_none(),
+            "empty: nothing queued, envelope kept"
+        );
+        assert!(matches!(app.screen, Screen::Unlock(_)));
+        app.paste(v["passphrase"].as_str().unwrap());
+        app.key(key(KeyCode::Enter));
+        app.perform(&mut c);
+        assert_eq!(revealed_text(&app), v["text"].as_str().unwrap());
+        assert_eq!(f.requests().len(), 1, "every retry was local");
+    }
+
+    #[test]
+    fn copy_secret_text_warns_then_copies() {
+        let v = vector("plain-ascii");
+        let f = serving_with_limit(hex(v["envelope_hex"].as_str().unwrap()), 262144);
+        let mut c = client(&f);
+        let clip = MemClip::default();
+        let link = format!("{}/s/{ID}#{}", f.origin, v["k_url"].as_str().unwrap());
+        let mut app = opened(&link, &mut c, clip.clone());
+        app.key(key(KeyCode::Enter));
+        app.perform(&mut c);
+        app.key(key(KeyCode::Char('c')));
+        assert_eq!(*clip.0.lock().unwrap(), None);
+        app.key(key(KeyCode::Char('c')));
+        assert_eq!(clip.0.lock().unwrap().as_deref(), v["text"].as_str());
+        // Leaving the app removes the copied secret from the clipboard.
+        drop(app);
+        assert_eq!(*clip.0.lock().unwrap(), None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn save_fails_then_another_directory_gets_all_bytes_one_consume() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe_is_root() {
+            return;
+        }
+        let (k, env, text, datas) = bundle_vector();
+        let f = serving_with_limit(env, 262144);
+        let mut c = client(&f);
+        let link = format!("{}/s/{ID}#{k}", f.origin);
+        let mut app = opened(&link, &mut c, MemClip::default());
+        app.key(key(KeyCode::Enter));
+        app.perform(&mut c);
+        assert_eq!(revealed_text(&app), text);
+        // Leaving with unsaved files needs a second press.
+        app.key(key(KeyCode::Esc));
+        assert!(matches!(app.screen, Screen::Revealed(_)));
+        let ro = std::env::temp_dir().join(format!("sdrop-tro-{}", rand_suffix()));
+        std::fs::create_dir_all(&ro).unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o500)).unwrap();
+        app.key(key(KeyCode::Char('s')));
+        app.paste(ro.join("x").to_str().unwrap());
+        app.key(key(KeyCode::Enter));
+        app.perform(&mut c);
+        assert!(matches!(app.screen, Screen::Revealed(_)));
+        assert!(app.message.as_ref().unwrap().1.contains("still here"));
+        assert!(!ro.join("x").exists());
+        let good = std::env::temp_dir().join(format!("sdrop-tok-{}", rand_suffix()));
+        if let Screen::Revealed(v) = &mut app.screen {
+            v.dir.clear();
+        }
+        app.paste(good.to_str().unwrap());
+        app.key(key(KeyCode::Enter));
+        app.perform(&mut c);
+        assert_eq!(std::fs::read_to_string(good.join("text")).unwrap(), text);
+        for (i, d) in datas.iter().enumerate() {
+            assert_eq!(
+                &std::fs::read(good.join(format!("file-{}", i + 1))).unwrap(),
+                d
+            );
+        }
+        assert_eq!(f.requests().len(), 1);
+        // Saved: leaving needs one press.
+        app.key(key(KeyCode::Esc));
+        assert!(matches!(app.screen, Screen::Home { .. }));
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn status_check_and_revoke_with_confirmation() {
+        let token = "B".repeat(42) + "A";
+        let revoked = Arc::new(Mutex::new(false));
+        let r2 = revoked.clone();
+        let f = Fake::start(Box::new(move |q| match q.method.as_str() {
+            "GET" => {
+                let state = if *r2.lock().unwrap() {
+                    "revoked"
+                } else {
+                    "stored"
+                };
+                (
+                    200,
+                    vec![],
+                    format!(r#"{{"state":"{state}","createdAt":"c","expiresAt":"e"}}"#)
+                        .into_bytes(),
+                )
+            }
+            "DELETE" => {
+                *r2.lock().unwrap() = true;
+                (204, vec![], vec![])
+            }
+            _ => (404, vec![], vec![]),
+        }));
+        let mut c = client(&f);
+        let mut app = App::new(Box::new(MemClip::default()));
+        app.key(key(KeyCode::Down));
+        app.key(key(KeyCode::Down));
+        app.key(key(KeyCode::Enter));
+        app.paste(&format!("{}/o/{ID}#{token}", f.origin));
+        app.key(key(KeyCode::Enter));
+        app.perform(&mut c);
+        let state = |app: &App| match &app.screen {
+            Screen::Status(v) => v.status.state.clone(),
+            _ => panic!("{:?}", app.message),
+        };
+        assert_eq!(state(&app), "stored");
+        app.key(key(KeyCode::Char('x')));
+        assert!(app.pending.is_none(), "first x only asks");
+        app.key(key(KeyCode::Char('x')));
+        app.perform(&mut c);
+        assert_eq!(state(&app), "revoked");
+        assert!(*revoked.lock().unwrap());
+        app.key(key(KeyCode::Char('r')));
+        app.perform(&mut c);
+        let methods: Vec<_> = f.requests().iter().map(|q| q.method.clone()).collect();
+        assert_eq!(methods, ["GET", "DELETE", "GET", "GET"]);
+        for q in f.requests() {
+            assert!(
+                q.headers
+                    .contains(&("authorization".into(), format!("Bearer {token}")))
+            );
+        }
+    }
+}
