@@ -583,7 +583,7 @@ impl App {
             KeyCode::Char('g') if ctrl => {
                 f.text.set(&crate::password::generate());
                 f.generated = true;
-                self.note("A random 24-character password. Save it where you need it.");
+                self.note("A password was generated. Save it where you need it.");
                 return;
             }
             _ => {}
@@ -939,9 +939,7 @@ impl App {
         );
         let hints = match &self.screen {
             Screen::Home { .. } => "↑↓ choose · Enter open · q quit",
-            Screen::New(_) => {
-                "Tab next · Shift+Tab back · Ctrl+S create · Ctrl+G generate password · Esc back · mouse: click"
-            }
+            Screen::New(_) => "Tab next · Shift+Tab back · Ctrl+S create · Esc back · mouse: click",
             Screen::Created(v) if v.show_owner => {
                 "c copy link · y copy status link · o hide · n new · Esc home"
             }
@@ -1024,7 +1022,6 @@ impl App {
                     Hit::Key(ctrl('s')),
                     true,
                 ),
-                b("Generate password  Ctrl+G", ctrl('g'), false),
                 b("Back  Esc", press(KeyCode::Esc), false),
             ],
             Screen::Created(v) => {

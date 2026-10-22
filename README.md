@@ -63,7 +63,7 @@ sdrop revoke 'https://secrets.example.com/o/…#…'
 
 `sdrop` without arguments on a terminal (or `sdrop tui`) opens a full-screen interface:
 
-- **New secret**: text (Ctrl+G generates a 24-character password), files by path (up to 20),
+- **New secret**: text (Ctrl+G generates a password), files by path (up to 20),
   lifetime, passphrase; **Ctrl+S** creates the link from any field (Shift/Cmd/Alt+Enter too, in
   terminals that report the modifier: kitty, WezTerm, Ghostty, Alacritty, iTerm2 with CSI u).
 - **Open a link**: nothing is sent until you confirm; the text is shown, files are saved into a
