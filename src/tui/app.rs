@@ -538,12 +538,12 @@ impl App {
     pub fn paste(&mut self, text: &str) {
         match &mut self.screen {
             Screen::New(f) => match f.focus {
-                NewFocus::Text => {
-                    f.text.insert(text);
+                NewFocus::Text => f.text.insert(text),
+                NewFocus::Path => f.path.insert(text),
+                NewFocus::Pass => {
+                    f.pass.insert(text);
                     f.generated = false;
                 }
-                NewFocus::Path => f.path.insert(text),
-                NewFocus::Pass => f.pass.insert(text),
                 _ => {}
             },
             Screen::Open(i) | Screen::StatusForm(i) => i.insert(text.trim()),
@@ -580,19 +580,23 @@ impl App {
             {
                 return self.request_create();
             }
+            // A random passphrase, when the passphrase is on (the secret itself is the user's).
             KeyCode::Char('g') if ctrl => {
-                f.text.set(&crate::password::generate());
-                f.generated = true;
-                self.note("A password was generated. Save it where you need it.");
+                if f.use_pass {
+                    f.pass.set(&crate::password::generate());
+                    f.generated = true;
+                    f.focus = NewFocus::Pass;
+                    self.note("Send the passphrase through a different channel than the link.");
+                } else {
+                    self.error("Turn on the passphrase first (Space).");
+                }
                 return;
             }
             _ => {}
         }
         match f.focus {
             NewFocus::Text => {
-                if edit(&mut f.text, k) {
-                    f.generated = false;
-                }
+                edit(&mut f.text, k);
             }
             NewFocus::Path => {
                 if k.code == KeyCode::Enter {
@@ -631,7 +635,9 @@ impl App {
                 }
             }
             NewFocus::Pass => {
-                edit(&mut f.pass, k);
+                if edit(&mut f.pass, k) {
+                    f.generated = false;
+                }
             }
             NewFocus::Create => {
                 if k.code == KeyCode::Enter {
@@ -1315,22 +1321,28 @@ fn skip_cols(line: &str, cols: usize) -> (&str, usize) {
 
 fn render_new(f: &mut Frame, area: Rect, form: &NewForm, hits: &mut Hits) {
     let files_h = (form.files.len() as u16).min(6) + 2;
-    let [text, path, files, ttl, pass] = Layout::vertical([
+    // Blank lines between the lifetime, the passphrase switch and the passphrase field.
+    let [text, path, files, _, ttl, _, toggle, _, field] = Layout::vertical([
         Constraint::Min(5),
         Constraint::Length(3),
         Constraint::Length(if form.files.is_empty() { 0 } else { files_h }),
         Constraint::Length(1),
-        Constraint::Length(if form.use_pass { 4 } else { 1 }),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(if form.use_pass { 1 } else { 0 }),
+        Constraint::Length(if form.use_pass { 3 } else { 0 }),
     ])
     .areas(area);
     hits.push((text, Hit::Focus(NewFocus::Text)));
     hits.push((path, Hit::Focus(NewFocus::Path)));
-    let title = if form.generated {
-        " Secret (generated password) "
-    } else {
-        " Secret "
-    };
-    render_input(f, text, &form.text, title, form.focus == NewFocus::Text);
+    render_input(
+        f,
+        text,
+        &form.text,
+        " Secret ",
+        form.focus == NewFocus::Text,
+    );
     let path_title = format!(
         " Add a file: path, then Enter ({}/{}) ",
         form.files.len(),
@@ -1406,7 +1418,6 @@ fn render_new(f: &mut Frame, area: Rect, form: &NewForm, hits: &mut Hits) {
         spans.push(Span::styled("  ←/→", Style::default().fg(ACCENT)));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), ttl);
-    let [toggle, field] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(pass);
     let mark = if form.use_pass { "[x]" } else { "[ ]" };
     let style = if form.focus == NewFocus::UsePass {
         Style::default().fg(ACCENT)
@@ -1419,16 +1430,32 @@ fn render_new(f: &mut Frame, area: Rect, form: &NewForm, hits: &mut Hits) {
     );
     hits.push((toggle, Hit::PassToggle));
     if form.use_pass {
-        hits.push((field, Hit::Focus(NewFocus::Pass)));
-    }
-    if form.use_pass {
-        render_input(
-            f,
-            field,
-            &form.pass,
-            " Passphrase: send it through a different channel ",
-            form.focus == NewFocus::Pass,
+        // The field, and the generator button to its right.
+        let label = " Generate  Ctrl+G ";
+        let [input, _, button] = Layout::horizontal([
+            Constraint::Min(10),
+            Constraint::Length(2),
+            Constraint::Length(label.len() as u16),
+        ])
+        .areas(field);
+        let title = if form.generated {
+            " Passphrase (generated): send it through a different channel "
+        } else {
+            " Passphrase: send it through a different channel "
+        };
+        render_input(f, input, &form.pass, title, form.focus == NewFocus::Pass);
+        hits.push((input, Hit::Focus(NewFocus::Pass)));
+        let button = Rect {
+            y: button.y + 1,
+            height: 1,
+            ..button
+        };
+        f.render_widget(
+            Paragraph::new(label)
+                .style(Style::default().fg(ACCENT).add_modifier(Modifier::REVERSED)),
+            button,
         );
+        hits.push((button, Hit::Key(ctrl('g'))));
     }
 }
 
@@ -2045,12 +2072,35 @@ pub mod tests {
         app.key(key(KeyCode::Enter));
         assert!(app.pending.is_none());
         assert!(screen_text(&app).contains("Enter a secret or add a file."));
+        // Ctrl+G is for the passphrase: without it, nothing is generated (the secret is the user's).
         app.key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
         let Screen::New(f) = &mut app.screen else {
             unreachable!()
         };
-        assert_eq!(f.text.text().chars().count(), crate::password::LENGTH);
+        assert_eq!(f.text.text(), "");
+        assert_eq!(f.pass.text(), "");
+        f.use_pass = true;
+        app.key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        let Screen::New(f) = &mut app.screen else {
+            unreachable!()
+        };
+        assert_eq!(f.pass.text().chars().count(), crate::password::LENGTH);
+        assert_eq!(f.text.text(), "");
         assert!(f.generated);
+        let first = f.pass.text().to_owned();
+        // The button beside the field does the same.
+        click(&mut app, Hit::Key(ctrl('g')));
+        let Screen::New(f) = &mut app.screen else {
+            unreachable!()
+        };
+        assert_ne!(f.pass.text(), first);
+        assert!(screen_text(&app).contains("Generate  Ctrl+G"));
+        let Screen::New(f) = &mut app.screen else {
+            unreachable!()
+        };
+        f.use_pass = false;
+        f.pass.clear();
+        f.generated = false;
         // A missing file is refused; a real one is listed.
         f.focus = NewFocus::Path;
         app.paste("/nonexistent/x");
