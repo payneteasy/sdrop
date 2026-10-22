@@ -423,11 +423,18 @@ fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// New private directory `sdrop-<id8>[-N]` (0700) and a `data` file in it.
-fn save_default(id: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
+/// Directory builder with mode 0700 on Unix; on Windows the directory inherits the parent's ACL.
+fn private_dir_builder() -> std::fs::DirBuilder {
+    #[allow(unused_mut)]
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder
+}
+
+/// New private directory `sdrop-<id8>[-N]` (0700) and a `data` file in it.
+fn save_default(id: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    let builder = private_dir_builder();
     for n in 0..100 {
         let dir = if n == 0 {
             PathBuf::from(format!("sdrop-{}", &id[..8]))
@@ -450,9 +457,7 @@ fn save_default(id: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
 /// New private directory (0700) with the given files (0600). On any error everything written is
 /// removed, so a retry starts clean.
 fn write_dir(dir: &Path, entries: &[(String, &[u8])]) -> std::io::Result<()> {
-    let mut builder = std::fs::DirBuilder::new();
-    #[cfg(unix)]
-    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    let builder = private_dir_builder();
     builder.create(dir)?;
     for (i, (name, bytes)) in entries.iter().enumerate() {
         if let Err(e) = write_new(&dir.join(name), bytes) {
