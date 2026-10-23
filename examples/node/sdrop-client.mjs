@@ -575,6 +575,7 @@ async function deliver(secret, id) {
   }
   if (entries.length === 0) return;
   let dir = `sdrop-${id.slice(0, 8)}`;
+  let triedTemp = false;
   for (;;) {
     try {
       mkdirSync(dir, { mode: 0o700 }); // fails if it exists: never write into someone's directory
@@ -595,8 +596,11 @@ async function deliver(secret, id) {
     } catch (e) {
       console.error(`Cannot save into ${dir}: ${e.code ?? e.message}. The secret is kept in memory.`);
       const typed = await askTerminal("Save into a new directory: ", { echo: true });
-      // Without a terminal: one last try in the system temporary directory.
-      dir = typed?.trim() || (dir.startsWith(tmpdir()) ? null : join(tmpdir(), `sdrop-${id.slice(0, 8)}-${Date.now()}`));
+      // An empty answer is asked again (the next failure asks once more); only without a terminal:
+      // one last try in the system temporary directory.
+      const fallback = join(tmpdir(), `sdrop-${id.slice(0, 8)}-${Date.now()}`);
+      dir = typed === null ? (triedTemp ? null : fallback) : typed.trim() || dir;
+      triedTemp ||= typed === null;
       if (!dir) throw new Error("could not save the files; the secret is already deleted from the server");
     }
   }
