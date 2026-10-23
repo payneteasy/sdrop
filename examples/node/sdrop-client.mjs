@@ -16,6 +16,7 @@
 import { mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import tty from "node:tty";
 
 const { subtle } = globalThis.crypto;
@@ -511,10 +512,12 @@ export async function askTerminal(prompt, { echo }) {
   t.input.setRawMode(true);
   t.output.write(prompt);
   let line = "";
+  // A character may arrive split across reads (SSH, slow terminals): decode as a stream.
+  const utf8Stream = new StringDecoder("utf8");
   try {
     return await new Promise((resolve, reject) => {
       t.input.on("data", (buf) => {
-        for (const ch of buf.toString("utf8")) {
+        for (const ch of utf8Stream.write(buf)) {
           if (ch === "\r" || ch === "\n") return resolve(line);
           if (ch === "\u0003") return reject(new Error("interrupted"));
           if (ch === "\u007f" || ch === "\b") {
@@ -535,34 +538,59 @@ export async function askTerminal(prompt, { echo }) {
   }
 }
 
-/** SDROP_PASSPHRASE, else asked on the terminal without echo; null if neither. */
-async function passphrase(prompt) {
-  if (process.env.SDROP_PASSPHRASE) return process.env.SDROP_PASSPHRASE;
-  const p = await askTerminal(prompt, { echo: false });
-  return p ? p : null;
+/** Asked on the terminal without echo; an empty answer is asked again (a stray Enter must not
+ * cost the secret). null without a terminal. */
+export async function askPassphrase(prompt) {
+  for (;;) {
+    const p = await askTerminal(prompt, { echo: false });
+    if (p === null || p !== "") return p;
+  }
 }
 
 /** Text to stdout and files into a new private directory; on any failure everything stays in
  * memory and another directory is asked for (the server copy is already gone). */
+/** Write to stdout and wait for the result (a closed pipe or a full disk is an error, not a
+ * crash). The error event may come after the write callback: a handler stays for good. */
+let stdoutError = null;
+function writeStdout(data) {
+  if (process.stdout.listenerCount("error") === 0) {
+    process.stdout.on("error", (e) => {
+      stdoutError ??= e;
+    });
+  }
+  return new Promise((resolve) => {
+    process.stdout.write(data, (e) => resolve(e ?? stdoutError));
+  });
+}
+
 async function deliver(secret, id) {
-  if (secret.text) process.stdout.write(secret.text + "\n");
-  if (secret.files.length === 0) return;
+  // The text to stdout; if that fails, it is saved with the files instead.
+  const entries = secret.files.map((f, i) => ({ path: `file-${i + 1}`, data: f.data, name: f.name }));
+  if (secret.text) {
+    const e = await writeStdout(secret.text + "\n");
+    if (e) {
+      console.error(`Cannot write the text to stdout (${e.code ?? e.message}); saving it as a file.`);
+      entries.unshift({ path: "text", data: utf8.encode(secret.text), name: null });
+    }
+  }
+  if (entries.length === 0) return;
   let dir = `sdrop-${id.slice(0, 8)}`;
   for (;;) {
     try {
       mkdirSync(dir, { mode: 0o700 }); // fails if it exists: never write into someone's directory
       try {
         // Sender names are only shown, never used as paths.
-        secret.files.forEach((f, i) => {
-          writeFileSync(join(dir, `file-${i + 1}`), f.data, { mode: 0o600, flag: "wx" });
-        });
+        for (const e of entries) {
+          writeFileSync(join(dir, e.path), e.data, { mode: 0o600, flag: "wx" });
+        }
       } catch (e) {
         rmSync(dir, { recursive: true, force: true }); // only what this call created
         throw e;
       }
-      secret.files.forEach((f, i) => {
-        console.error(`${dir}/file-${i + 1}: the sender named it ${JSON.stringify(f.name)}`);
-      });
+      for (const e of entries) {
+        const named = e.name === null ? "the text" : `the sender named it ${JSON.stringify(e.name)}`;
+        console.error(`${dir}/${e.path}: ${named}`);
+      }
       return;
     } catch (e) {
       console.error(`Cannot save into ${dir}: ${e.code ?? e.message}. The secret is kept in memory.`);
@@ -605,7 +633,7 @@ async function main([cmd, ...args]) {
     // A passphrase given in the environment is used whether or not the link says `~p`.
     let pass = process.env.SDROP_PASSPHRASE || null;
     if (link.passphraseHint && pass === null) {
-      pass = await passphrase("Passphrase: ");
+      pass = await askPassphrase("Passphrase: ");
       if (pass === null) throw new Error("the link needs a passphrase: set SDROP_PASSPHRASE");
     }
     const env = await c.consume(link.id);
@@ -621,10 +649,10 @@ async function main([cmd, ...args]) {
       } catch (e) {
         const retry = e.code === "need_passphrase" || (e.code === "decrypt_failed" && pass !== null);
         if (!retry || attempt >= 3) throw e;
-        pass = await askTerminal("Passphrase (the secret is already deleted from the server): ", {
-          echo: false,
-        });
-        if (!pass) throw new Error("no passphrase; the secret is already deleted from the server");
+        pass = await askPassphrase("Passphrase (the secret is already deleted from the server): ");
+        if (pass === null) {
+          throw new Error("no terminal to ask the passphrase; the secret is already deleted from the server");
+        }
       }
     }
     return deliver(secret, link.id);
