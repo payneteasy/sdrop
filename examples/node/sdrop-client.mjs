@@ -3,18 +3,20 @@
 // (WebCrypto, fetch and String.prototype.normalize are built in). It follows FORMAT.md and is a
 // starting point for your own client, not a replacement for `sdrop`.
 //
-//   node sdrop-client.mjs selftest [spec-dir]      check against the shared test vectors
+//   node sdrop-client.mjs selftest [spec-dir]    check against the shared test vectors
 //   echo "text" | node sdrop-client.mjs put [--ttl 3600|86400|604800] [file ...]
-//   node sdrop-client.mjs get <recipient-link | ->  ("-": the link from stdin)
-//   node sdrop-client.mjs status <sender-link>
-//   node sdrop-client.mjs revoke <sender-link>
+//   node sdrop-client.mjs get                    the recipient link from stdin
+//   node sdrop-client.mjs status | revoke        the sender link from stdin
 //
-// Environment: SDROP_ORIGIN (https://secrets.example.com), SDROP_PASSPHRASE (optional),
-// SDROP_ACCESS_TOKEN (only for a service behind Cloudflare Access).
+// Links, passphrases and tokens are never command-line arguments (other users can see them in
+// the process list). Environment: SDROP_ORIGIN (https://secrets.example.com), SDROP_PASSPHRASE
+// (optional; else asked on the terminal without echo), SDROP_ACCESS_TOKEN (only for a service
+// behind Cloudflare Access).
 
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { createInterface } from "node:readline/promises";
+import tty from "node:tty";
 
 const { subtle } = globalThis.crypto;
 const random = (n) => globalThis.crypto.getRandomValues(new Uint8Array(n));
@@ -484,15 +486,91 @@ async function readStdin() {
   return Buffer.concat(chunks);
 }
 
-/** Passphrase: SDROP_PASSPHRASE, else asked on the terminal (never a command-line argument). */
-async function askPassphrase(prompt) {
-  if (process.env.SDROP_PASSPHRASE) return process.env.SDROP_PASSPHRASE;
-  if (!process.stdin.isTTY) return null;
-  const rl = createInterface({ input: process.stdin, output: process.stderr });
+/** The controlling terminal, apart from stdin (which may carry the link): null if there is none. */
+function openTerminal() {
+  for (const [input, output] of [
+    ["/dev/tty", "/dev/tty"],
+    ["CONIN$", "CONOUT$"],
+  ]) {
+    try {
+      const i = openSync(input, "r");
+      const o = openSync(output, "w");
+      return { input: new tty.ReadStream(i), output: new tty.WriteStream(o), fds: [i, o] };
+    } catch {
+      // not this platform
+    }
+  }
+  return null;
+}
+
+/** A line typed on the terminal without echo (passphrases) or with echo; null without a terminal. */
+export async function askTerminal(prompt, { echo }) {
+  const t = openTerminal();
+  if (!t) return null;
+  // Echo is off before the prompt appears, so nothing typed after it is shown.
+  t.input.setRawMode(true);
+  t.output.write(prompt);
+  let line = "";
   try {
-    return (await rl.question(prompt)) || null;
+    return await new Promise((resolve, reject) => {
+      t.input.on("data", (buf) => {
+        for (const ch of buf.toString("utf8")) {
+          if (ch === "\r" || ch === "\n") return resolve(line);
+          if (ch === "\u0003") return reject(new Error("interrupted"));
+          if (ch === "\u007f" || ch === "\b") {
+            line = [...line].slice(0, -1).join("");
+            if (echo) t.output.write("\b \b");
+          } else if (ch >= " ") {
+            line += ch;
+            if (echo) t.output.write(ch);
+          }
+        }
+      });
+    });
   } finally {
-    rl.close();
+    t.output.write("\n");
+    t.input.setRawMode(false);
+    t.input.destroy();
+    t.output.destroy();
+  }
+}
+
+/** SDROP_PASSPHRASE, else asked on the terminal without echo; null if neither. */
+async function passphrase(prompt) {
+  if (process.env.SDROP_PASSPHRASE) return process.env.SDROP_PASSPHRASE;
+  const p = await askTerminal(prompt, { echo: false });
+  return p ? p : null;
+}
+
+/** Text to stdout and files into a new private directory; on any failure everything stays in
+ * memory and another directory is asked for (the server copy is already gone). */
+async function deliver(secret, id) {
+  if (secret.text) process.stdout.write(secret.text + "\n");
+  if (secret.files.length === 0) return;
+  let dir = `sdrop-${id.slice(0, 8)}`;
+  for (;;) {
+    try {
+      mkdirSync(dir, { mode: 0o700 }); // fails if it exists: never write into someone's directory
+      try {
+        // Sender names are only shown, never used as paths.
+        secret.files.forEach((f, i) => {
+          writeFileSync(join(dir, `file-${i + 1}`), f.data, { mode: 0o600, flag: "wx" });
+        });
+      } catch (e) {
+        rmSync(dir, { recursive: true, force: true }); // only what this call created
+        throw e;
+      }
+      secret.files.forEach((f, i) => {
+        console.error(`${dir}/file-${i + 1}: the sender named it ${JSON.stringify(f.name)}`);
+      });
+      return;
+    } catch (e) {
+      console.error(`Cannot save into ${dir}: ${e.code ?? e.message}. The secret is kept in memory.`);
+      const typed = await askTerminal("Save into a new directory: ", { echo: true });
+      // Without a terminal: one last try in the system temporary directory.
+      dir = typed?.trim() || (dir.startsWith(tmpdir()) ? null : join(tmpdir(), `sdrop-${id.slice(0, 8)}-${Date.now()}`));
+      if (!dir) throw new Error("could not save the files; the secret is already deleted from the server");
+    }
   }
 }
 
@@ -514,19 +592,22 @@ async function main([cmd, ...args]) {
     }
     const files = args.map((p) => ({ name: sanitizeName(basename(p)), data: readFileSync(p) }));
     const text = process.stdin.isTTY ? "" : strictUtf8.decode(await readStdin()).replace(/\n$/, "");
-    const passphrase = process.env.SDROP_PASSPHRASE || null;
-    const c = await client().create(text, files, passphrase, ttl);
+    const c = await client().create(text, files, process.env.SDROP_PASSPHRASE || null, ttl);
     console.log(c.recipient); // for the recipient
     console.error(`Only for you, to check or revoke: ${c.owner}\nExpires: ${c.expiresAt}`);
     return;
   }
+  if (args.length > 0) throw new Error("pass the link on stdin, not as an argument");
   if (cmd === "get") {
     const c = client();
-    const raw = args[0] === "-" ? (await readStdin()).toString("utf8") : args[0] ?? "";
     // The whole link is checked before any request: a broken link consumes nothing.
-    const link = parseLink(raw, c.origin, "s");
-    let passphrase = link.passphraseHint ? await askPassphrase("Passphrase: ") : null;
-    if (link.passphraseHint && passphrase === null) throw new Error("the link needs a passphrase");
+    const link = parseLink((await readStdin()).toString("utf8"), c.origin, "s");
+    // A passphrase given in the environment is used whether or not the link says `~p`.
+    let pass = process.env.SDROP_PASSPHRASE || null;
+    if (link.passphraseHint && pass === null) {
+      pass = await passphrase("Passphrase: ");
+      if (pass === null) throw new Error("the link needs a passphrase: set SDROP_PASSPHRASE");
+    }
     const env = await c.consume(link.id);
     if (env === null) {
       throw new Error("not found, already read, revoked or expired; if not by you, tell the sender");
@@ -535,34 +616,30 @@ async function main([cmd, ...args]) {
     let secret;
     for (let attempt = 0; ; attempt++) {
       try {
-        secret = await decrypt(env, link.key, passphrase);
+        secret = await decrypt(env, link.key, pass);
         break;
       } catch (e) {
-        const retry = e.code === "need_passphrase" || (e.code === "decrypt_failed" && passphrase);
-        if (!retry || attempt >= 3 || !process.stdin.isTTY) throw e;
-        passphrase = await askPassphrase("Passphrase (the secret is already deleted from the server): ");
+        const retry = e.code === "need_passphrase" || (e.code === "decrypt_failed" && pass !== null);
+        if (!retry || attempt >= 3) throw e;
+        pass = await askTerminal("Passphrase (the secret is already deleted from the server): ", {
+          echo: false,
+        });
+        if (!pass) throw new Error("no passphrase; the secret is already deleted from the server");
       }
     }
-    if (secret.text) process.stdout.write(secret.text + "\n");
-    if (secret.files.length) {
-      // Sender names are only shown, never used as paths.
-      const dir = `sdrop-${link.id.slice(0, 8)}`;
-      mkdirSync(dir, { mode: 0o700 });
-      secret.files.forEach((f, i) => {
-        writeFileSync(join(dir, `file-${i + 1}`), f.data, { mode: 0o600, flag: "wx" });
-        console.error(`${dir}/file-${i + 1}: the sender named it ${JSON.stringify(f.name)}`);
-      });
-    }
-    return;
+    return deliver(secret, link.id);
   }
   if (cmd === "status" || cmd === "revoke") {
     const c = client();
-    const link = parseLink(args[0] ?? "", c.origin, "o");
-    const r = cmd === "status" ? await c.status(link.id, link.ownerToken) : await c.revoke(link.id, link.ownerToken);
+    const link = parseLink((await readStdin()).toString("utf8"), c.origin, "o");
+    const r =
+      cmd === "status"
+        ? await c.status(link.id, link.ownerToken)
+        : await c.revoke(link.id, link.ownerToken);
     console.log(r === null ? "not found or expired" : JSON.stringify(r));
     return;
   }
-  console.error("usage: selftest | put [--ttl N] [file...] | get <link|-> | status <link> | revoke <link>");
+  console.error("usage: selftest | put [--ttl N] [file...] | get | status | revoke (links on stdin)");
   process.exitCode = 2;
 }
 

@@ -35,7 +35,8 @@ The key travels only in the `#fragment`, which HTTP clients and browsers never s
 
 1. **The key and the passphrase never leave the client.** Never send the fragment, never put it in
    a query string, a log, an analytics event, a crash report or a command-line argument (other
-   users can see process arguments). The same goes for the plaintext and the sender link.
+   users can see process arguments). The same goes for the plaintext and the sender link. Read
+   passphrases without echo, so they stay out of the terminal's scrollback.
 2. **One trusted origin.** Configure the service address once. Parse a link completely before any
    request: exactly that origin, `/s/` (recipient) or `/o/` (sender), an id of 64 lowercase hex
    characters, a fragment of 43 base64url characters that decodes to 32 bytes and encodes back to
@@ -49,8 +50,9 @@ The key travels only in the `#fragment`, which HTTP clients and browsers never s
    with the envelope you already have: the server copy is gone. If saving to disk fails, keep the
    plaintext in memory and ask for another place.
 6. **Passphrase.** If the link ends in `~p`, ask for the passphrase before consuming. The source of
-   truth is the envelope flag: if it needs a passphrase and the link had no `~p`, ask after
-   fetching.
+   truth is the envelope flag: if it needs a passphrase and the link had no `~p` (lost when the
+   link was forwarded), use a passphrase the user already gave or ask after fetching. Ask on the
+   terminal itself, not on stdin, which may carry the link.
 7. **File names come from the sender.** Show them, but never use them as paths: save as `file-1`,
    `file-2`, … in a new directory only the user can read.
 8. **The same answer for every miss.** Not found, already read, revoked, expired and invalid id are
@@ -149,11 +151,13 @@ Authorization: Bearer <ownerToken>
 404  not found or expired
 ```
 
-With `curl`, the sender side looks like this (`$TOKEN` from the fragment of the sender link):
+With `curl`, the sender side looks like this (`$ID` and `$TOKEN` from the sender link). The
+header goes through stdin: `printf` is a shell builtin, so the token never appears in the process
+list, as it would in `-H "Authorization: Bearer $TOKEN"`:
 
 ```sh
-curl -s -H 'X-Secret-Drop: 1' -H "Authorization: Bearer $TOKEN" \
-  https://secrets.example.com/api/secrets/$ID/status
+printf 'Authorization: Bearer %s\n' "$TOKEN" |
+  curl -s -H 'X-Secret-Drop: 1' -H @- https://secrets.example.com/api/secrets/$ID/status
 ```
 
 ## Other answers
@@ -203,12 +207,14 @@ vectors; CI runs the self-test.
 ```sh
 node examples/node/sdrop-client.mjs selftest
 export SDROP_ORIGIN=https://secrets.example.com
-echo "db password" | node examples/node/sdrop-client.mjs put --ttl 3600 notes.txt
-node examples/node/sdrop-client.mjs get -              # the link from stdin
-node examples/node/sdrop-client.mjs status 'https://secrets.example.com/o/…'
+echo "db password" | node examples/node/sdrop-client.mjs put --ttl 3600 notes.txt >link.txt
+node examples/node/sdrop-client.mjs get <link.txt          # links always come on stdin
+pbpaste | node examples/node/sdrop-client.mjs status       # the sender link from the clipboard
 ```
 
-The passphrase comes from `SDROP_PASSPHRASE` or is asked on the terminal.
+Links are read from stdin, never from arguments. The passphrase comes from `SDROP_PASSPHRASE` or
+is asked on the terminal without echo. Received files go to a new private directory; if saving
+fails, the files stay in memory and another directory is asked for.
 
 ## Compatibility
 
