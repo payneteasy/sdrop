@@ -3,7 +3,9 @@
 Command line client for Payneteasy Secrets: one-time links for
 passwords, keys and files. Everything is encrypted on your machine; the server keeps only the
 ciphertext, and the key travels in the part of the link after `#`, which never reaches the server.
-A link opens once and is then destroyed. The format is described in [FORMAT.md](FORMAT.md).
+A link opens once and is then destroyed. The format is described in [FORMAT.md](FORMAT.md); to
+write your own client against the same API, see [CLIENTS.md](CLIENTS.md) and the dependency-free
+reference in [examples/node](examples/node/sdrop-client.mjs).
 
 ## Install
 

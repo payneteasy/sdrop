@@ -121,7 +121,10 @@ is the same (`u32 len | JSON | data | zeros`) with the header
 
 ## 6. HTTP API
 
-Every `/api/*` request carries `X-Secret-Drop: 1`. Times are ISO 8601 strings in UTC with
+Every `/api/*` request carries `X-Secret-Drop: 1`; the API allows no CORS, and a request that
+changes something is refused if it carries an `Origin` other than the service's own (clients
+outside a browser send none). Responses carry `Cache-Control: no-store`; 401 and 403 mean the
+service's login does not allow the request. Times are ISO 8601 strings in UTC with
 milliseconds (`2026-10-22T12:00:00.000Z`). A service behind Cloudflare Access answers an
 unauthenticated request with a redirect; clients do not follow it (the request never reached the
 service, nothing was consumed), obtain an Access token (`cf-access-token` header) and retry once.
@@ -129,7 +132,7 @@ service, nothing was consumed), obtain an Access token (`cf-access-token` header
 - `GET /api/limits` → 200 `{"maxBucket": N}`: the largest bucket the service accepts. Clients
   check it before encrypting.
 - `POST /api/secrets?ttl=<seconds>`, body: the envelope, `Content-Type: application/octet-stream`.
-  `ttl` is 3600, 86400 (default) or 604800. → 201 `{"id": string, "expiresAt": string,
+  `ttl` is 3600, 86400 (default) or 604800; another `Content-Type` is 400. → 201 `{"id": string, "expiresAt": string,
   "ownerToken": string}`: `id` as in section 5, `ownerToken` 43 base64url characters (32 bytes);
   400 for a malformed envelope or `ttl`; 413 `{"error":"too_large","maxBucket":N}` above the
   service limit; 429 when creating too often.
@@ -143,6 +146,8 @@ service, nothing was consumed), obtain an Access token (`cf-access-token` header
   (the reader's email) only on a service with login. A wrong token gives the same 404.
 - `DELETE /api/secrets/<id>` with `Authorization: Bearer <ownerToken>` → 204 (revoked, repeat is
   fine), 409 with the status body if already read, 404 otherwise.
+
+How to use all this in your own client, step by step: [CLIENTS.md](CLIENTS.md).
 
 ## 7. Test vectors
 
